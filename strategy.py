@@ -24,14 +24,20 @@ import pandas as pd
 import yfinance as yf
 import requests
 
-# ── yfinance session with browser headers to avoid rate limiting ──────────────
+# ── yfinance session — bypass Yahoo rate limiting on cloud IPs ────────────────
 
 def _make_session():
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Origin": "https://finance.yahoo.com",
+        "Referer": "https://finance.yahoo.com/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
     })
     return s
 
@@ -41,33 +47,33 @@ _SESSION = _make_session()
 # ── Data fetch ────────────────────────────────────────────────────────────────
 
 def get_price_data(ticker: str) -> pd.DataFrame | None:
-    """1 year of daily OHLCV — enough for all indicators."""
+    """Fetch via yfinance Ticker.history — more reliable than yf.download on cloud."""
     for attempt in range(3):
         try:
+            # Refresh session cookies on each attempt
+            _SESSION.get("https://finance.yahoo.com", timeout=5)
             t  = yf.Ticker(ticker, session=_SESSION)
-            df = t.history(period="1y", interval="1d", auto_adjust=True)
-            if df.empty or len(df) < 60:
-                if attempt < 2:
-                    time.sleep(2)
-                    continue
-                return None
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df.columns = [str(c) for c in df.columns]
-            return df
+            df = t.history(period="1y", interval="1d", auto_adjust=True, raise_errors=False)
+            if df is not None and not df.empty and len(df) >= 60:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df.columns = [str(c) for c in df.columns]
+                return df
+            time.sleep(2 + attempt * 2)
         except Exception as e:
-            if attempt < 2:
-                time.sleep(2)
-            else:
-                print(f"[{ticker}] price data failed: {e}")
-                return None
+            print(f"[{ticker}] attempt {attempt+1} failed: {e}")
+            time.sleep(2 + attempt * 2)
+    print(f"[{ticker}] No price data")
     return None
 
 
 def get_fundamentals(ticker: str) -> dict:
     try:
+        _SESSION.get("https://finance.yahoo.com", timeout=5)
         t    = yf.Ticker(ticker, session=_SESSION)
         info = t.info
+        if not info or len(info) < 5:
+            return {}
         trailing_eps = info.get("trailingEps") or 0
         forward_eps  = info.get("forwardEps")  or 0
         if trailing_eps and trailing_eps != 0 and forward_eps:
