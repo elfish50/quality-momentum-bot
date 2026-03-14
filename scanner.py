@@ -8,20 +8,21 @@ import math
 import time
 import asyncio
 import traceback
+import requests
 from datetime import datetime
 
 import pandas as pd
 import yfinance as yf
 
 from universe import get_all_tickers
-from strategy import analyze_ticker
+from strategy import analyze_ticker, _SESSION
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MIN_PRICE      = 10.0
 MAX_PRICE      = 2000.0
 MIN_AVG_VOLUME = 500_000
 BATCH_SIZE     = 10
-BATCH_DELAY    = 1.5
+BATCH_DELAY    = 2.0
 
 
 # ── Pre-filter ────────────────────────────────────────────────────────────────
@@ -30,31 +31,22 @@ def pre_filter(tickers: list) -> list:
     passed = []
     print(f"Pre-filtering {len(tickers)} tickers...")
 
-    for i in range(0, len(tickers), 50):
-        batch = tickers[i:i+50]
-        df    = None
+    for i, ticker in enumerate(tickers):
         try:
-            df = yf.download(" ".join(batch), period="5d", interval="1d",
-                             group_by="ticker", auto_adjust=True,
-                             progress=False, threads=False)
-            for t in batch:
-                try:
-                    sub = df[t] if len(batch) > 1 else df
-                    if sub.empty or len(sub) < 2:
-                        continue
-                    price = float(sub["Close"].iloc[-1])
-                    vol   = float(sub["Volume"].mean())
-                    if MIN_PRICE <= price <= MAX_PRICE and vol >= MIN_AVG_VOLUME:
-                        passed.append(t)
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"Pre-filter batch error: {e}")
-        finally:
-            if df is not None:
-                del df
-            gc.collect()
-        time.sleep(0.5)
+            t  = yf.Ticker(ticker, session=_SESSION)
+            df = t.history(period="5d", interval="1d", auto_adjust=True)
+            if df.empty or len(df) < 2:
+                continue
+            price = float(df["Close"].iloc[-1])
+            vol   = float(df["Volume"].mean())
+            if MIN_PRICE <= price <= MAX_PRICE and vol >= MIN_AVG_VOLUME:
+                passed.append(ticker)
+        except Exception:
+            continue
+
+        if i > 0 and i % 50 == 0:
+            print(f"Pre-filter progress: {i}/{len(tickers)}, passed: {len(passed)}")
+            time.sleep(1.0)
 
     print(f"Pre-filter: {len(passed)}/{len(tickers)} passed")
     return passed
