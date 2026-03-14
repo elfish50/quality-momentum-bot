@@ -238,8 +238,17 @@ async def scheduled_scan(bot):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+from telegram.request import HTTPXRequest
+
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
+    )
+    app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
 
     app.add_handler(CommandHandler("start",          start))
     app.add_handler(CommandHandler("help",           start))
