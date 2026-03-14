@@ -1,6 +1,3 @@
-
-Copy
-
 """
 universe.py
 Loads NASDAQ + NYSE ticker lists with 24h cache.
