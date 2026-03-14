@@ -39,11 +39,11 @@ def av_get(params: dict, retries: int = 3) -> dict:
 
 
 def get_price_data(ticker: str) -> pd.DataFrame | None:
-    """Daily OHLCV — 1 year via Alpha Vantage TIME_SERIES_DAILY."""
+    """Daily OHLCV — last 100 days via Alpha Vantage (free tier compatible)."""
     data = av_get({
         "function":   "TIME_SERIES_DAILY",
         "symbol":     ticker,
-        "outputsize": "full",
+        "outputsize": "compact",
     })
 
     ts = data.get("Time Series (Daily)")
@@ -65,10 +65,6 @@ def get_price_data(ticker: str) -> pd.DataFrame | None:
     df = pd.DataFrame(rows)
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
-
-    # Keep last 1 year
-    cutoff = pd.Timestamp.now() - pd.DateOffset(years=1)
-    df = df[df["Date"] >= cutoff].reset_index(drop=True)
 
     if len(df) < 60:
         print(f"[{ticker}] Not enough price data ({len(df)} bars)")
@@ -127,7 +123,8 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     low    = df["Low"]
     volume = df["Volume"]
 
-    sma200 = close.rolling(200).mean()
+    # Use 50 SMA as trend filter (200 needs too much data for compact)
+    sma100 = close.rolling(100).mean()
     sma50  = close.rolling(50).mean()
     sma20  = close.rolling(20).mean()
 
@@ -154,23 +151,24 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         past = float(close.iloc[-n])
         return (price_now - past) / past if past != 0 else 0.0
 
-    mom_6m = pct_return(126)
     mom_3m = pct_return(63)
     mom_1m = pct_return(21)
-    momentum_score = mom_6m * 0.6 + mom_3m * 0.4
+    mom_2w = pct_return(10)
+    # Compact data: weight 1M * 0.6 + 2W * 0.4
+    momentum_score = mom_1m * 0.6 + mom_2w * 0.4
 
-    vol_ratio = float(
-        (volume.rolling(20).mean() / volume.rolling(50).mean()).iloc[-1]
-    ) if not pd.isna((volume.rolling(20).mean() / volume.rolling(50).mean()).iloc[-1]) else 1.0
+    vol_20  = volume.rolling(20).mean().iloc[-1]
+    vol_50  = volume.rolling(50).mean().iloc[-1]
+    vol_ratio = float(vol_20 / vol_50) if vol_50 and not pd.isna(vol_50) and vol_50 > 0 else 1.0
 
     return {
         "price":          price_now,
-        "sma200":         float(sma200.iloc[-1]) if not pd.isna(sma200.iloc[-1]) else None,
+        "sma200":         float(sma100.iloc[-1]) if not pd.isna(sma100.iloc[-1]) else None,
         "sma50":          float(sma50.iloc[-1])  if not pd.isna(sma50.iloc[-1])  else None,
         "sma20":          float(sma20.iloc[-1])  if not pd.isna(sma20.iloc[-1])  else None,
         "rsi":            float(rsi.iloc[-1])    if not pd.isna(rsi.iloc[-1])    else None,
         "atr14":          float(atr14.iloc[-1])  if not pd.isna(atr14.iloc[-1])  else None,
-        "mom_6m":         mom_6m,
+        "mom_6m":         mom_3m,   # remapped: show 3M as main momentum
         "mom_3m":         mom_3m,
         "mom_1m":         mom_1m,
         "momentum_score": momentum_score,
@@ -349,21 +347,3 @@ def analyze_ticker(ticker: str) -> dict | None:
     except Exception:
         print(f"[{ticker}] ERROR: {traceback.format_exc()[-200:]}")
         return None
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
