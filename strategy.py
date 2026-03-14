@@ -17,49 +17,68 @@ SIGNAL STRENGTH → HOLD TIME:
 """
 
 import math
+import time
 import traceback
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import requests
+
+# ── yfinance session with browser headers to avoid rate limiting ──────────────
+
+def _make_session():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    })
+    return s
+
+_SESSION = _make_session()
 
 
 # ── Data fetch ────────────────────────────────────────────────────────────────
 
 def get_price_data(ticker: str) -> pd.DataFrame | None:
     """1 year of daily OHLCV — enough for all indicators."""
-    try:
-        df = yf.download(ticker, period="1y", interval="1d",
-                         auto_adjust=True, progress=False)
-        if df.empty or len(df) < 60:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.columns = [str(c) for c in df.columns]
-        return df
-    except Exception:
-        return None
+    for attempt in range(3):
+        try:
+            t  = yf.Ticker(ticker, session=_SESSION)
+            df = t.history(period="1y", interval="1d", auto_adjust=True)
+            if df.empty or len(df) < 60:
+                if attempt < 2:
+                    time.sleep(2)
+                    continue
+                return None
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df.columns = [str(c) for c in df.columns]
+            return df
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                print(f"[{ticker}] price data failed: {e}")
+                return None
+    return None
 
 
 def get_fundamentals(ticker: str) -> dict:
-    """
-    Pull fundamentals from yfinance info dict.
-    Returns dict with ROE, debtToEquity, grossMargins, epsGrowth, marketCap.
-    """
     try:
-        info = yf.Ticker(ticker).info
-        # EPS growth: compare trailingEps vs forwardEps as proxy
+        t    = yf.Ticker(ticker, session=_SESSION)
+        info = t.info
         trailing_eps = info.get("trailingEps") or 0
         forward_eps  = info.get("forwardEps")  or 0
         if trailing_eps and trailing_eps != 0 and forward_eps:
             eps_growth = (forward_eps - trailing_eps) / abs(trailing_eps)
         else:
             eps_growth = info.get("earningsGrowth") or 0
-
         return {
-            "roe":          info.get("returnOnEquity")   or 0,   # e.g. 0.25 = 25%
-            "debt_equity":  info.get("debtToEquity")     or 999, # ratio
-            "gross_margin": info.get("grossMargins")     or 0,   # e.g. 0.45 = 45%
-            "eps_growth":   eps_growth,                          # e.g. 0.15 = 15%
+            "roe":          info.get("returnOnEquity")   or 0,
+            "debt_equity":  info.get("debtToEquity")     or 999,
+            "gross_margin": info.get("grossMargins")     or 0,
+            "eps_growth":   eps_growth,
             "market_cap":   info.get("marketCap")        or 0,
             "sector":       info.get("sector")           or "Unknown",
             "name":         info.get("shortName")        or ticker,
