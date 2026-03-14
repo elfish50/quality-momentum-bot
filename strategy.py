@@ -136,50 +136,57 @@ def quality_score(fund: dict) -> tuple[float, list]:
     """
     Returns (score 0-100, list of failed checks).
     Score weights: ROE 30 | Gross Margin 25 | EPS Growth 25 | Debt/Equity 20
+    Loosened thresholds to account for missing/partial yfinance data.
     """
     score  = 0.0
     passed = []
     failed = []
 
-    # ROE > 15% (max points at 30%+)
+    # ROE > 8% (loosened from 15%)
     roe = fund.get("roe", 0)
-    if roe >= 0.30:
+    if roe >= 0.20:
         score += 30; passed.append(f"ROE {roe:.0%} (excellent)")
-    elif roe >= 0.15:
-        score += 15 + (roe - 0.15) / 0.15 * 15
+    elif roe >= 0.08:
+        score += 15 + (roe - 0.08) / 0.12 * 15
         passed.append(f"ROE {roe:.0%} (good)")
+    elif roe > 0:
+        score += 8   # partial credit for any positive ROE
+        failed.append(f"ROE {roe:.0%} < 8%")
     else:
-        failed.append(f"ROE {roe:.0%} < 15%")
+        failed.append(f"ROE missing or negative")
 
-    # Gross Margin > 40%
+    # Gross Margin > 20% (loosened from 40%)
     gm = fund.get("gross_margin", 0)
-    if gm >= 0.60:
+    if gm >= 0.50:
         score += 25; passed.append(f"Margin {gm:.0%} (excellent)")
-    elif gm >= 0.40:
-        score += 10 + (gm - 0.40) / 0.20 * 15
-        passed.append(f"Margin {gm:.0%} (good)")
+    elif gm >= 0.20:
+        score += 10 + (gm - 0.20) / 0.30 * 15
+        passed.append(f"Margin {gm:.0%} (ok)")
+    elif gm > 0:
+        score += 5
+        failed.append(f"Gross margin {gm:.0%} < 20%")
     else:
-        failed.append(f"Gross margin {gm:.0%} < 40%")
+        failed.append(f"Gross margin missing")
 
-    # EPS Growth > 10%
+    # EPS Growth > 0% (loosened from 10%) — just needs to be growing
     eg = fund.get("eps_growth", 0)
-    if eg >= 0.25:
+    if eg >= 0.20:
         score += 25; passed.append(f"EPS growth {eg:.0%} (excellent)")
-    elif eg >= 0.10:
-        score += 10 + (eg - 0.10) / 0.15 * 15
-        passed.append(f"EPS growth {eg:.0%} (good)")
+    elif eg >= 0.00:
+        score += 10 + eg / 0.20 * 15
+        passed.append(f"EPS growth {eg:.0%} (positive)")
     else:
-        failed.append(f"EPS growth {eg:.0%} < 10%")
+        failed.append(f"EPS growth {eg:.0%} negative")
 
-    # Debt/Equity < 0.5 (lower is better)
+    # Debt/Equity < 1.5 (loosened from 0.5)
     de = fund.get("debt_equity", 999)
-    if de <= 0.20:
+    if de <= 0.30:
         score += 20; passed.append(f"D/E {de:.2f} (fortress)")
-    elif de <= 0.50:
-        score += 20 - (de - 0.20) / 0.30 * 10
-        passed.append(f"D/E {de:.2f} (healthy)")
+    elif de <= 1.50:
+        score += 20 - (de - 0.30) / 1.20 * 15
+        passed.append(f"D/E {de:.2f} (acceptable)")
     else:
-        failed.append(f"D/E {de:.2f} > 0.5")
+        failed.append(f"D/E {de:.2f} > 1.5")
 
     return round(score, 1), failed
 
@@ -253,9 +260,9 @@ def position_size(price: float, atr: float, account: float = 100_000,
 # ── Hold time classification ──────────────────────────────────────────────────
 
 def classify_hold(signal_score: float) -> str:
-    if signal_score >= 80:
+    if signal_score >= 70:
         return "POSITION (2-6 weeks)"
-    elif signal_score >= 60:
+    elif signal_score >= 45:
         return "SWING (3-10 days)"
     else:
         return "SKIP"
@@ -283,13 +290,13 @@ def analyze_ticker(ticker: str) -> dict | None:
             return None
 
         # 4. RSI filter — not overbought, not in freefall
-        if not (35 <= tech["rsi"] <= 70):
+        if not (30 <= tech["rsi"] <= 75):
             print(f"[{ticker}] SKIP | RSI {tech['rsi']:.0f} out of range")
             return None
 
-        # 5. Momentum filter — positive 6M momentum
-        if tech["mom_6m"] <= 0:
-            print(f"[{ticker}] SKIP | Negative 6M momentum")
+        # 5. Momentum filter — positive 3M momentum (loosened from 6M)
+        if tech["mom_3m"] <= -0.10:  # only skip if down more than 10% in 3 months
+            print(f"[{ticker}] SKIP | Negative 3M momentum {tech['mom_3m']:.1%}")
             return None
 
         # 6. Fundamentals
@@ -300,8 +307,8 @@ def analyze_ticker(ticker: str) -> dict | None:
 
         q_score, failed = quality_score(fund)
 
-        # Must pass at least 3 of 4 quality checks (score >= 40)
-        if q_score < 40:
+        # Must pass quality score >= 25 (loosened from 40)
+        if q_score < 25:
             print(f"[{ticker}] SKIP | Quality score {q_score} — failed: {failed}")
             return None
 
