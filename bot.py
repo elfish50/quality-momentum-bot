@@ -290,6 +290,7 @@ def main():
     app.run_webhook(
         listen="0.0.0.0",
         port=int(os.getenv("PORT", 10000)),
+        url_path="webhook",
         webhook_url=f"{webhook_url}/webhook",
         drop_pending_updates=True,
     )
