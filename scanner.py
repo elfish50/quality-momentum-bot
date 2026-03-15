@@ -1,8 +1,7 @@
 """
 scanner.py — Quality Momentum Scanner
-Uses Alpha Vantage for price + fundamental data.
-Free tier: 25 calls/day — use /check for individual stocks,
-/scan for full universe (uses calls budget).
+Uses Financial Modeling Prep (FMP) for price + fundamental data.
+Free tier: 250 calls/day = ~125 stocks per scan (2 calls each).
 """
 import gc
 import time
@@ -13,13 +12,17 @@ from datetime import datetime
 from universe import get_all_tickers
 from strategy import analyze_ticker
 
-BATCH_SIZE  = 5
-BATCH_DELAY = 15  # Alpha Vantage free = 25 calls/min max
+BATCH_SIZE  = 10
+BATCH_DELAY = 12   # 250 calls/day = ~10 calls/min safely
+MAX_STOCKS  = 120  # stay under 250 calls/day limit
 
 
 def run_scan(tickers: list = None) -> tuple[list, float]:
     start   = time.time()
     tickers = tickers or get_all_tickers()
+
+    # Limit to SP500 quality stocks for full scans
+    tickers = tickers[:MAX_STOCKS]
     alerts  = []
 
     print(f"Scanning {len(tickers)} tickers...")
@@ -35,8 +38,8 @@ def run_scan(tickers: list = None) -> tuple[list, float]:
         finally:
             gc.collect()
 
-        # Rate limiting — free tier 25 req/min
         if (i + 1) % BATCH_SIZE == 0:
+            print(f"Progress: {i+1}/{len(tickers)} | Alerts: {len(alerts)}")
             time.sleep(BATCH_DELAY)
 
     alerts.sort(key=lambda x: x["signal_score"], reverse=True)
@@ -60,7 +63,7 @@ def format_alert(sig: dict) -> str:
         f"",
         f"--- Price ---",
         f"Price:    ${sig['price']:.2f}",
-        f"SMA200:   ${sig['sma200']:.2f}  (trend UP)",
+        f"SMA100:   ${sig['sma200']:.2f}  (trend UP)",
         f"RSI(14):  {sig['rsi']:.1f}",
         f"",
         f"--- Momentum ---",
@@ -88,7 +91,7 @@ def format_alert(sig: dict) -> str:
         f"Stop:     ${sig['stop']:.2f}  (2x ATR)",
         f"Target 1: ${sig['tp1']:.2f}  (1:1 R/R)",
         f"Target 2: ${sig['tp2']:.2f}  (1:1.5 R/R)",
-        f"Shares:   {sig['shares']}  (${sig['position_val']:,.0f}  {sig['pct_account']:.1f}% of account)",
+        f"Shares:   {sig['shares']}  (${sig['position_val']:,.0f}  {sig['pct_account']:.1f}% of $100k)",
         f"Max loss: ${sig['risk_dollars']:.0f}",
         f"{'='*36}",
     ]
@@ -109,13 +112,15 @@ def format_summary(alerts: list, elapsed: float, universe_size: int) -> str:
         f"SWING trades:    {len(swings)}\n"
         f"Total alerts:    {len(alerts)}\n"
         f"{'='*36}\n"
+        f"Data: Financial Modeling Prep\n"
+        f"Strategy: Quality + Momentum + Trend\n"
     )
     if positions:
-        msg += "\nTop POSITION trades:\n"
+        msg += f"\nTop POSITION trades:\n"
         for a in positions[:5]:
             msg += f"  {a['ticker']} | Score {a['signal_score']:.0f} | Mom {a['momentum_score']:+.1f}% | ROE {a['roe']:.0f}%\n"
     if swings:
-        msg += "\nTop SWING trades:\n"
+        msg += f"\nTop SWING trades:\n"
         for a in swings[:5]:
             msg += f"  {a['ticker']} | Score {a['signal_score']:.0f} | Mom {a['momentum_score']:+.1f}% | RSI {a['rsi']:.0f}\n"
     return msg
@@ -125,30 +130,21 @@ async def run_universe_scan(bot, chat_id: str, tickers: list = None):
     from universe import load_universe
 
     if tickers:
-        universe_size = len(tickers)
         scan_list     = tickers
+        universe_size = len(tickers)
     else:
-        universe      = load_universe()
-        universe_size = len(universe.get("ALL", []))
-        scan_list     = None
-
-    # Alpha Vantage free = 25 calls/day
-    # Each stock = 2 calls (price + fundamentals)
-    # So max 12 stocks per day on free tier
-    MAX_FREE = 12
-    if scan_list is None:
-        # Use SP500 only for scheduled scans — best quality stocks
-        from universe import load_universe
         u         = load_universe()
-        scan_list = u.get("SP500", [])[:MAX_FREE]
+        sp500     = u.get("SP500", [])
+        scan_list = sp500[:MAX_STOCKS]
+        universe_size = len(scan_list)
 
     await bot.send_message(
         chat_id=chat_id,
         text=(
             f"Quality Momentum Scan starting...\n"
-            f"Scanning {len(scan_list)} tickers\n"
-            f"(Alpha Vantage free tier: 25 calls/day)\n"
-            f"Est. time: {len(scan_list) * 2}–{len(scan_list) * 3} min"
+            f"Scanning {universe_size} tickers\n"
+            f"Data: Financial Modeling Prep (250 calls/day)\n"
+            f"Est. time: {universe_size * 2 // 60 + 1}-{universe_size * 3 // 60 + 2} min"
         )
     )
 
@@ -164,13 +160,13 @@ async def run_universe_scan(bot, chat_id: str, tickers: list = None):
         )
         return
 
-    summary = format_summary(alerts, elapsed, len(scan_list))
+    summary = format_summary(alerts, elapsed, universe_size)
     await bot.send_message(chat_id=chat_id, text=summary)
 
     if not alerts:
         await bot.send_message(
             chat_id=chat_id,
-            text="No stocks passed filters today. Try again tomorrow or use /check AAPL to test a specific stock."
+            text="No stocks passed all filters today.\nTry /check AAPL to test a specific stock."
         )
         return
 
