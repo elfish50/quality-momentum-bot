@@ -1,6 +1,6 @@
 """
 QUALITY MOMENTUM STRATEGY
-Data: Alpha Vantage API (free tier - 25 calls/day)
+Data: Financial Modeling Prep (FMP) API - 250 calls/day free
 Markets: NASDAQ + NYSE
 """
 
@@ -8,110 +8,90 @@ import os
 import math
 import time
 import traceback
-import numpy as np
 import pandas as pd
 import requests
 
-AV_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
-AV_URL = "https://www.alphavantage.co/query"
+FMP_KEY = os.getenv("FMP_KEY", "")
+FMP_URL = "https://financialmodelingprep.com/api/v3"
 
 
-# ── Alpha Vantage data fetch ──────────────────────────────────────────────────
+# ── FMP data fetch ────────────────────────────────────────────────────────────
 
-def av_get(params: dict, retries: int = 3) -> dict:
-    params["apikey"] = AV_KEY
+def fmp_get(endpoint: str, params: dict = {}, retries: int = 3) -> dict | list:
+    params["apikey"] = FMP_KEY
+    url = f"{FMP_URL}/{endpoint}"
     for attempt in range(retries):
         try:
-            r = requests.get(AV_URL, params=params, timeout=15)
-            data = r.json()
-            if "Note" in data:
-                print("Alpha Vantage rate limit hit — waiting 60s...")
+            r = requests.get(url, params=params, timeout=15)
+            if r.status_code == 429:
+                print("FMP rate limit — waiting 60s...")
                 time.sleep(60)
                 continue
-            if "Information" in data:
-                print(f"AV info: {data['Information'][:80]}")
-                return {}
-            return data
+            return r.json()
         except Exception as e:
-            print(f"AV request failed attempt {attempt+1}: {e}")
+            print(f"FMP request failed attempt {attempt+1}: {e}")
             time.sleep(3)
     return {}
 
 
 def get_price_data(ticker: str) -> pd.DataFrame | None:
-    """Daily OHLCV — last 100 days via Alpha Vantage (free tier compatible)."""
-    data = av_get({
-        "function":   "TIME_SERIES_DAILY",
-        "symbol":     ticker,
-        "outputsize": "compact",
-    })
+    """Daily OHLCV — last 6 months via FMP."""
+    data = fmp_get(f"historical-price-full/{ticker}", {"timeseries": 180})
 
-    ts = data.get("Time Series (Daily)")
-    if not ts:
-        print(f"[{ticker}] No price data from AV")
+    if not data or "historical" not in data:
+        print(f"[{ticker}] No price data from FMP")
         return None
 
-    rows = []
-    for date_str, vals in ts.items():
-        rows.append({
-            "Date":   date_str,
-            "Open":   float(vals["1. open"]),
-            "High":   float(vals["2. high"]),
-            "Low":    float(vals["3. low"]),
-            "Close":  float(vals["4. close"]),
-            "Volume": float(vals["5. volume"]),
-        })
+    rows = data["historical"]
+    if len(rows) < 60:
+        print(f"[{ticker}] Not enough price data ({len(rows)} bars)")
+        return None
 
     df = pd.DataFrame(rows)
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.sort_values("Date").reset_index(drop=True)
-
-    if len(df) < 60:
-        print(f"[{ticker}] Not enough price data ({len(df)} bars)")
-        return None
-
-    return df
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df = df.rename(columns={
+        "date": "Date", "open": "Open", "high": "High",
+        "low": "Low", "close": "Close", "volume": "Volume"
+    })
+    return df[["Date", "Open", "High", "Low", "Close", "Volume"]]
 
 
 def get_fundamentals(ticker: str) -> dict:
-    """Company overview via Alpha Vantage OVERVIEW endpoint."""
-    data = av_get({
-        "function": "OVERVIEW",
-        "symbol":   ticker,
-    })
+    """Company profile + key metrics via FMP."""
+    # Profile (name, sector, market cap)
+    profile_data = fmp_get(f"profile/{ticker}")
+    profile = profile_data[0] if isinstance(profile_data, list) and profile_data else {}
 
-    if not data or "Symbol" not in data:
-        print(f"[{ticker}] No fundamental data from AV")
-        return {}
+    # Key metrics TTM (ROE, gross margin, debt/equity, PE)
+    metrics_data = fmp_get(f"key-metrics-ttm/{ticker}")
+    metrics = metrics_data[0] if isinstance(metrics_data, list) and metrics_data else {}
+
+    # Financial ratios TTM (gross margin, eps growth)
+    ratios_data = fmp_get(f"ratios-ttm/{ticker}")
+    ratios = ratios_data[0] if isinstance(ratios_data, list) and ratios_data else {}
 
     def safe_float(val, default=0.0):
         try:
-            return float(val) if val not in (None, "None", "-", "") else default
+            return float(val) if val not in (None, "None", "", "N/A") else default
         except Exception:
             return default
 
-    roe          = safe_float(data.get("ReturnOnEquityTTM"))
-    gross_margin = safe_float(data.get("GrossProfitTTM"))
-    revenue      = safe_float(data.get("RevenueTTM"))
-    gross_margin_pct = (gross_margin / revenue) if revenue > 0 else 0.0
-
-    eps           = safe_float(data.get("EPS"))
-    forward_pe    = safe_float(data.get("ForwardPE"))
-    trailing_pe   = safe_float(data.get("TrailingPE"))
-    price         = safe_float(data.get("AnalystTargetPrice"))
-    eps_growth    = safe_float(data.get("QuarterlyEarningsGrowthYOY"))
-
-    debt_equity   = safe_float(data.get("DebtToEquityRatio"), default=999)
+    roe          = safe_float(metrics.get("roeTTM"))
+    gross_margin = safe_float(ratios.get("grossProfitMarginTTM"))
+    debt_equity  = safe_float(metrics.get("debtToEquityTTM"), default=999)
+    eps_growth   = safe_float(ratios.get("earningsPerShareGrowth") or metrics.get("netIncomePerShareGrowth"))
+    pe_ratio     = safe_float(metrics.get("peRatioTTM"))
 
     return {
         "roe":          roe,
         "debt_equity":  debt_equity,
-        "gross_margin": gross_margin_pct,
+        "gross_margin": gross_margin,
         "eps_growth":   eps_growth,
-        "market_cap":   safe_float(data.get("MarketCapitalization")),
-        "sector":       data.get("Sector", "Unknown"),
-        "name":         data.get("Name", ticker),
-        "pe_ratio":     trailing_pe,
+        "market_cap":   safe_float(profile.get("mktCap")),
+        "sector":       profile.get("sector", "Unknown"),
+        "name":         profile.get("companyName", ticker),
+        "pe_ratio":     pe_ratio,
     }
 
 
@@ -123,7 +103,6 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     low    = df["Low"]
     volume = df["Volume"]
 
-    # Use 50 SMA as trend filter (200 needs too much data for compact)
     sma100 = close.rolling(100).mean()
     sma50  = close.rolling(50).mean()
     sma20  = close.rolling(20).mean()
@@ -151,14 +130,13 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         past = float(close.iloc[-n])
         return (price_now - past) / past if past != 0 else 0.0
 
-    mom_3m = pct_return(63)
+    mom_6m = pct_return(126) if len(close) >= 126 else pct_return(len(close) - 1)
+    mom_3m = pct_return(63)  if len(close) >= 63  else pct_return(len(close) - 1)
     mom_1m = pct_return(21)
-    mom_2w = pct_return(10)
-    # Compact data: weight 1M * 0.6 + 2W * 0.4
-    momentum_score = mom_1m * 0.6 + mom_2w * 0.4
+    momentum_score = mom_6m * 0.6 + mom_3m * 0.4
 
-    vol_20  = volume.rolling(20).mean().iloc[-1]
-    vol_50  = volume.rolling(50).mean().iloc[-1]
+    vol_20 = volume.rolling(20).mean().iloc[-1]
+    vol_50 = volume.rolling(50).mean().iloc[-1]
     vol_ratio = float(vol_20 / vol_50) if vol_50 and not pd.isna(vol_50) and vol_50 > 0 else 1.0
 
     return {
@@ -168,7 +146,7 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         "sma20":          float(sma20.iloc[-1])  if not pd.isna(sma20.iloc[-1])  else None,
         "rsi":            float(rsi.iloc[-1])    if not pd.isna(rsi.iloc[-1])    else None,
         "atr14":          float(atr14.iloc[-1])  if not pd.isna(atr14.iloc[-1])  else None,
-        "mom_6m":         mom_3m,   # remapped: show 3M as main momentum
+        "mom_6m":         mom_6m,
         "mom_3m":         mom_3m,
         "mom_1m":         mom_1m,
         "momentum_score": momentum_score,
@@ -190,7 +168,7 @@ def quality_score(fund: dict) -> tuple[float, list]:
     elif roe > 0:
         score += 8
     else:
-        failed.append(f"ROE {roe:.0%}")
+        failed.append(f"ROE {roe:.1%}")
 
     gm = fund.get("gross_margin", 0)
     if gm >= 0.50:
@@ -200,7 +178,7 @@ def quality_score(fund: dict) -> tuple[float, list]:
     elif gm > 0:
         score += 5
     else:
-        failed.append(f"Margin {gm:.0%}")
+        failed.append(f"Margin {gm:.1%}")
 
     eg = fund.get("eps_growth", 0)
     if eg >= 0.20:
@@ -208,7 +186,7 @@ def quality_score(fund: dict) -> tuple[float, list]:
     elif eg >= 0.0:
         score += 10 + eg / 0.20 * 15
     else:
-        failed.append(f"EPS growth {eg:.0%}")
+        failed.append(f"EPS growth {eg:.1%}")
 
     de = fund.get("debt_equity", 999)
     if de <= 0.30:
@@ -224,8 +202,8 @@ def quality_score(fund: dict) -> tuple[float, list]:
 # ── Signal scoring ────────────────────────────────────────────────────────────
 
 def compute_signal_score(tech: dict, q_score: float) -> float:
-    mom      = tech["momentum_score"]
-    mom_pts  = min(35, max(0, mom * 100 * 0.35))
+    mom     = tech["momentum_score"]
+    mom_pts = min(35, max(0, mom * 100 * 0.35))
 
     tech_pts = 0.0
     rsi = tech.get("rsi")
@@ -281,7 +259,7 @@ def analyze_ticker(ticker: str) -> dict | None:
             return None
 
         if tech["price"] <= tech["sma200"]:
-            print(f"[{ticker}] SKIP | Below 200 SMA")
+            print(f"[{ticker}] SKIP | Below 100 SMA")
             return None
 
         if not (30 <= tech["rsi"] <= 75):
@@ -305,7 +283,7 @@ def analyze_ticker(ticker: str) -> dict | None:
         hold_time = classify_hold(sig_score)
 
         if hold_time == "SKIP":
-            print(f"[{ticker}] SKIP | Signal score {sig_score}")
+            print(f"[{ticker}] SKIP | Signal {sig_score}")
             return None
 
         atr    = tech["atr14"] or (tech["price"] * 0.02)
