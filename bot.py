@@ -1,7 +1,7 @@
 """
 Quality Momentum Bot
 Berkshire-style quality screen + quantitative momentum
-NASDAQ + NYSE | Alpha Vantage | Render (webhook mode)
+NASDAQ + NYSE | FMP data | Koyeb
 """
 import asyncio
 import json
@@ -276,24 +276,13 @@ def main():
 
     async def on_startup(application):
         scheduler.start()
-        # Delete any existing webhook first
+        # Delete any existing webhook to ensure clean polling
         await application.bot.delete_webhook(drop_pending_updates=True)
-        # Use hardcoded Render URL
-        webhook_url = os.getenv("RENDER_EXTERNAL_URL", "https://quality-momentum-bot.onrender.com")
-        await application.bot.set_webhook(f"{webhook_url}/webhook")
-        print(f"Webhook set: {webhook_url}/webhook")
         print("Scheduler started — daily scan at 9:30 AM ET (Mon-Fri)")
 
     app.post_init = on_startup
     print("Quality Momentum Bot running!")
-    webhook_url = os.getenv("RENDER_EXTERNAL_URL", "https://quality-momentum-bot.onrender.com")
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.getenv("PORT", 10000)),
-        url_path="webhook",
-        webhook_url=f"{webhook_url}/webhook",
-        drop_pending_updates=True,
-    )
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
