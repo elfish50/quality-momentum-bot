@@ -1,15 +1,13 @@
 """
 Quality Momentum Bot
 Berkshire-style quality screen + quantitative momentum
-NASDAQ + NYSE | Alpha Vantage | Render
+NASDAQ + NYSE | Alpha Vantage | Render (webhook mode)
 """
 import asyncio
 import json
 import os
 import traceback
 from datetime import datetime
-from threading import Thread
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
@@ -17,19 +15,6 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
 
 from config import BOT_TOKEN, CHAT_ID
-
-
-# ── Health check server (keeps Render free web service alive) ─────────────────
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running!")
-    def log_message(self, format, *args):
-        pass
-
-Thread(target=lambda: HTTPServer(("0.0.0.0", int(os.getenv("PORT", 10000))), HealthHandler).serve_forever(), daemon=True).start()
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -291,11 +276,28 @@ def main():
 
     async def on_startup(application):
         scheduler.start()
+        # Set webhook so Telegram pushes updates instead of polling
+        webhook_url = os.getenv("RENDER_EXTERNAL_URL", "")
+        if webhook_url:
+            await application.bot.set_webhook(f"{webhook_url}/webhook")
+            print(f"Webhook set: {webhook_url}/webhook")
         print("Scheduler started — daily scan at 9:30 AM ET (Mon-Fri)")
 
     app.post_init = on_startup
     print("Quality Momentum Bot running!")
-    app.run_polling()
+
+    webhook_url = os.getenv("RENDER_EXTERNAL_URL", "")
+    if webhook_url:
+        # Webhook mode — no conflict possible
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.getenv("PORT", 10000)),
+            webhook_url=f"{webhook_url}/webhook",
+            drop_pending_updates=True,
+        )
+    else:
+        # Fallback to polling for local dev
+        app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
