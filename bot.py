@@ -1,18 +1,35 @@
 """
 Quality Momentum Bot
 Berkshire-style quality screen + quantitative momentum
-NASDAQ + NYSE | yfinance (free) | Railway
+NASDAQ + NYSE | Alpha Vantage | Render
 """
 import asyncio
 import json
+import os
 import traceback
 from datetime import datetime
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.request import HTTPXRequest
 
 from config import BOT_TOKEN, CHAT_ID
+
+
+# ── Health check server (keeps Render free web service alive) ─────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+    def log_message(self, format, *args):
+        pass
+
+Thread(target=lambda: HTTPServer(("0.0.0.0", int(os.getenv("PORT", 10000))), HealthHandler).serve_forever(), daemon=True).start()
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
