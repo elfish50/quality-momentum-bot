@@ -3,5 +3,5 @@ apscheduler==3.10.4
 python-dotenv==1.0.0
 requests==2.31.0
 pandas==2.2.3
-numpy==2.1.3
-yfinance==0.2.40
+numpy==1.26.4
+yfinance==0.2.54
