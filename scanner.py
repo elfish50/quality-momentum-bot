@@ -52,6 +52,7 @@ def format_alert(sig: dict) -> str:
     hold  = sig["hold_time"]
     score = sig["signal_score"]
     label = "POSITION" if "POSITION" in hold else "SWING"
+    vol_note = "Volume confirmed" if sig.get("vol_confirmed") else "Low volume — weaker signal"
 
     lines = [
         f"{'='*36}",
@@ -61,16 +62,19 @@ def format_alert(sig: dict) -> str:
         f"Hold:     {hold}",
         f"Sector:   {sig['sector']}",
         f"",
-        f"--- Price ---",
-        f"Price:    ${sig['price']:.2f}",
-        f"SMA100:   ${sig['sma200']:.2f}  (trend UP)",
-        f"RSI(14):  {sig['rsi']:.1f}",
+        f"--- Bollinger Band Pattern ---",
+        f"Lower Band touches: {sig['n_touches']} (min 3 needed)",
+        f"BB Lower: ${sig['bb_lower']:.2f}",
+        f"BB Mid:   ${sig['bb_mid']:.2f}  (Target 1)",
+        f"BB Upper: ${sig['bb_upper']:.2f}  (Target 2)",
+        f"BB Width: {sig['bb_width']:.1f}%  (volatility)",
+        f"Volume:   {sig['vol_ratio']:.1f}x avg  — {vol_note}",
         f"",
-        f"--- Momentum ---",
-        f"6-Month:  {sig['mom_6m']:+.1f}%",
-        f"3-Month:  {sig['mom_3m']:+.1f}%",
-        f"1-Month:  {sig['mom_1m']:+.1f}%",
-        f"Score:    {sig['momentum_score']:+.1f}%",
+        f"--- Price & Momentum ---",
+        f"Price:    ${sig['price']:.2f}",
+        f"RSI(14):  {sig['rsi']:.1f}  (breakout from oversold)",
+        f"SMA50:    ${sig['sma50']:.2f}" if sig.get('sma50') else "SMA50:    N/A",
+        f"SMA200:   ${sig['sma200']:.2f}" if sig.get('sma200') else "SMA200:   N/A",
         f"",
         f"--- Quality (Berkshire Screen) ---",
         f"ROE:          {sig['roe']:.1f}%",
@@ -88,9 +92,9 @@ def format_alert(sig: dict) -> str:
         f"",
         f"--- Risk Management (1% rule) ---",
         f"Entry:    ${sig['price']:.2f}",
-        f"Stop:     ${sig['stop']:.2f}  (2x ATR)",
-        f"Target 1: ${sig['tp1']:.2f}  (1:1 R/R)",
-        f"Target 2: ${sig['tp2']:.2f}  (1:1.5 R/R)",
+        f"Stop:     ${sig['stop']:.2f}  (below 3rd touch low)",
+        f"Target 1: ${sig['tp1']:.2f}  (+{sig['tp1_pct']:.1f}% — middle band)",
+        f"Target 2: ${sig['tp2']:.2f}  (+{sig['tp2_pct']:.1f}% — upper band)",
         f"Shares:   {sig['shares']}  (${sig['position_val']:,.0f}  {sig['pct_account']:.1f}% of $100k)",
         f"Max loss: ${sig['risk_dollars']:.0f}",
         f"{'='*36}",
@@ -104,25 +108,26 @@ def format_summary(alerts: list, elapsed: float, universe_size: int) -> str:
     ts        = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     msg = (
-        f"Quality Momentum Scan — {ts}\n"
+        f"BB 3rd Touch Breakout Scan — {ts}\n"
         f"{'='*36}\n"
         f"Scanned:         {universe_size:,} tickers\n"
         f"Duration:        {elapsed:.0f}s\n"
-        f"POSITION trades: {len(positions)}\n"
-        f"SWING trades:    {len(swings)}\n"
+        f"POSITION setups: {len(positions)}\n"
+        f"SWING setups:    {len(swings)}\n"
         f"Total alerts:    {len(alerts)}\n"
         f"{'='*36}\n"
-        f"Data: Financial Modeling Prep\n"
-        f"Strategy: Quality + Momentum + Trend\n"
+        f"Strategy: BB Lower Band 3rd Touch Breakout\n"
+        f"          + Berkshire Quality Screen\n"
+        f"Target:   TP1 = Middle Band | TP2 = Upper Band\n"
     )
     if positions:
-        msg += f"\nTop POSITION trades:\n"
+        msg += f"\nTop POSITION setups:\n"
         for a in positions[:5]:
-            msg += f"  {a['ticker']} | Score {a['signal_score']:.0f} | Mom {a['momentum_score']:+.1f}% | ROE {a['roe']:.0f}%\n"
+            msg += f"  {a['ticker']} | Score {a['signal_score']:.0f} | {a['n_touches']} touches | RSI {a['rsi']:.0f} | Vol {a['vol_ratio']:.1f}x\n"
     if swings:
-        msg += f"\nTop SWING trades:\n"
+        msg += f"\nTop SWING setups:\n"
         for a in swings[:5]:
-            msg += f"  {a['ticker']} | Score {a['signal_score']:.0f} | Mom {a['momentum_score']:+.1f}% | RSI {a['rsi']:.0f}\n"
+            msg += f"  {a['ticker']} | Score {a['signal_score']:.0f} | {a['n_touches']} touches | RSI {a['rsi']:.0f} | +{a['tp1_pct']:.1f}% to TP1\n"
     return msg
 
 
