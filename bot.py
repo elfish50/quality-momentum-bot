@@ -276,7 +276,8 @@ def main():
 
     async def on_startup(application):
         scheduler.start()
-        # Set webhook so Telegram pushes updates instead of polling
+        # Always delete existing webhook first to avoid conflicts
+        await application.bot.delete_webhook(drop_pending_updates=True)
         webhook_url = os.getenv("RENDER_EXTERNAL_URL", "")
         if webhook_url:
             await application.bot.set_webhook(f"{webhook_url}/webhook")
