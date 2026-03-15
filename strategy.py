@@ -1,7 +1,8 @@
 """
 QUALITY MOMENTUM STRATEGY
-Data: Financial Modeling Prep (FMP) API - 250 calls/day free
-Markets: NASDAQ + NYSE
+Price data:   Alpaca Markets API (free, unlimited)
+Fundamentals: Finnhub API (free, 60 calls/min)
+Markets:      NASDAQ + NYSE + SP500
 """
 
 import os
@@ -10,89 +11,115 @@ import time
 import traceback
 import pandas as pd
 import requests
+from datetime import datetime, timedelta
 
-FMP_KEY = os.getenv("FMP_KEY", "")
-FMP_URL = "https://financialmodelingprep.com/api/v3"
+ALPACA_KEY    = os.getenv("ALPACA_KEY", "")
+ALPACA_SECRET = os.getenv("ALPACA_SECRET", "")
+FINNHUB_KEY   = os.getenv("FINNHUB_KEY", "")
+
+ALPACA_URL  = "https://data.alpaca.markets/v2"
+FINNHUB_URL = "https://finnhub.io/api/v1"
 
 
-# ── FMP data fetch ────────────────────────────────────────────────────────────
-
-def fmp_get(endpoint: str, params: dict = {}, retries: int = 3) -> dict | list:
-    params["apikey"] = FMP_KEY
-    url = f"{FMP_URL}/{endpoint}"
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=15)
-            if r.status_code == 429:
-                print("FMP rate limit — waiting 60s...")
-                time.sleep(60)
-                continue
-            return r.json()
-        except Exception as e:
-            print(f"FMP request failed attempt {attempt+1}: {e}")
-            time.sleep(3)
-    return {}
-
+# ── Price data via Alpaca ─────────────────────────────────────────────────────
 
 def get_price_data(ticker: str) -> pd.DataFrame | None:
-    """Daily OHLCV — last 6 months via FMP."""
-    data = fmp_get(f"historical-price-full/{ticker}", {"timeseries": 180})
+    """6 months of daily OHLCV from Alpaca free tier."""
+    end   = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
 
-    if not data or "historical" not in data:
-        print(f"[{ticker}] No price data from FMP")
+    headers = {
+        "APCA-API-KEY-ID":     ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+    params = {
+        "start":     start,
+        "end":       end,
+        "timeframe": "1Day",
+        "limit":     200,
+        "feed":      "iex",
+    }
+
+    try:
+        r = requests.get(
+            f"{ALPACA_URL}/stocks/{ticker}/bars",
+            headers=headers,
+            params=params,
+            timeout=15,
+        )
+        data = r.json()
+
+        bars = data.get("bars")
+        if not bars or len(bars) < 60:
+            print(f"[{ticker}] Not enough price data ({len(bars) if bars else 0} bars)")
+            return None
+
+        rows = []
+        for bar in bars:
+            rows.append({
+                "Date":   pd.to_datetime(bar["t"]),
+                "Open":   float(bar["o"]),
+                "High":   float(bar["h"]),
+                "Low":    float(bar["l"]),
+                "Close":  float(bar["c"]),
+                "Volume": float(bar["v"]),
+            })
+
+        df = pd.DataFrame(rows).sort_values("Date").reset_index(drop=True)
+        return df
+
+    except Exception as e:
+        print(f"[{ticker}] Alpaca error: {e}")
         return None
 
-    rows = data["historical"]
-    if len(rows) < 60:
-        print(f"[{ticker}] Not enough price data ({len(rows)} bars)")
-        return None
 
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
-    df = df.rename(columns={
-        "date": "Date", "open": "Open", "high": "High",
-        "low": "Low", "close": "Close", "volume": "Volume"
-    })
-    return df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-
+# ── Fundamentals via Finnhub ──────────────────────────────────────────────────
 
 def get_fundamentals(ticker: str) -> dict:
-    """Company profile + key metrics via FMP."""
-    # Profile (name, sector, market cap)
-    profile_data = fmp_get(f"profile/{ticker}")
-    profile = profile_data[0] if isinstance(profile_data, list) and profile_data else {}
-
-    # Key metrics TTM (ROE, gross margin, debt/equity, PE)
-    metrics_data = fmp_get(f"key-metrics-ttm/{ticker}")
-    metrics = metrics_data[0] if isinstance(metrics_data, list) and metrics_data else {}
-
-    # Financial ratios TTM (gross margin, eps growth)
-    ratios_data = fmp_get(f"ratios-ttm/{ticker}")
-    ratios = ratios_data[0] if isinstance(ratios_data, list) and ratios_data else {}
-
+    """Company metrics via Finnhub free tier."""
     def safe_float(val, default=0.0):
         try:
             return float(val) if val not in (None, "None", "", "N/A") else default
         except Exception:
             return default
 
-    roe          = safe_float(metrics.get("roeTTM"))
-    gross_margin = safe_float(ratios.get("grossProfitMarginTTM"))
-    debt_equity  = safe_float(metrics.get("debtToEquityTTM"), default=999)
-    eps_growth   = safe_float(ratios.get("earningsPerShareGrowth") or metrics.get("netIncomePerShareGrowth"))
-    pe_ratio     = safe_float(metrics.get("peRatioTTM"))
+    try:
+        # Basic financials
+        r1 = requests.get(
+            f"{FINNHUB_URL}/stock/metric",
+            params={"symbol": ticker, "metric": "all", "token": FINNHUB_KEY},
+            timeout=15,
+        )
+        metrics = r1.json().get("metric", {})
 
-    return {
-        "roe":          roe,
-        "debt_equity":  debt_equity,
-        "gross_margin": gross_margin,
-        "eps_growth":   eps_growth,
-        "market_cap":   safe_float(profile.get("mktCap")),
-        "sector":       profile.get("sector", "Unknown"),
-        "name":         profile.get("companyName", ticker),
-        "pe_ratio":     pe_ratio,
-    }
+        # Company profile
+        r2 = requests.get(
+            f"{FINNHUB_URL}/stock/profile2",
+            params={"symbol": ticker, "token": FINNHUB_KEY},
+            timeout=15,
+        )
+        profile = r2.json()
+
+        roe          = safe_float(metrics.get("roeTTM")) / 100  # Finnhub returns % 
+        gross_margin = safe_float(metrics.get("grossMarginTTM")) / 100
+        debt_equity  = safe_float(metrics.get("totalDebt/totalEquityAnnual"), default=999)
+        eps_growth   = safe_float(metrics.get("epsGrowth3Y")) / 100
+        pe_ratio     = safe_float(metrics.get("peNormalizedAnnual"))
+
+        return {
+            "roe":          roe,
+            "debt_equity":  debt_equity,
+            "gross_margin": gross_margin,
+            "eps_growth":   eps_growth,
+            "market_cap":   safe_float(profile.get("marketCapitalization")) * 1_000_000,
+            "sector":       profile.get("finnhubIndustry", "Unknown"),
+            "name":         profile.get("name", ticker),
+            "pe_ratio":     pe_ratio,
+        }
+
+    except Exception as e:
+        print(f"[{ticker}] Finnhub error: {e}")
+        return {}
 
 
 # ── Technical indicators ──────────────────────────────────────────────────────
@@ -135,8 +162,8 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     mom_1m = pct_return(21)
     momentum_score = mom_6m * 0.6 + mom_3m * 0.4
 
-    vol_20 = volume.rolling(20).mean().iloc[-1]
-    vol_50 = volume.rolling(50).mean().iloc[-1]
+    vol_20    = volume.rolling(20).mean().iloc[-1]
+    vol_50    = volume.rolling(50).mean().iloc[-1]
     vol_ratio = float(vol_20 / vol_50) if vol_50 and not pd.isna(vol_50) and vol_50 > 0 else 1.0
 
     return {
