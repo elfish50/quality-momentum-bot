@@ -276,29 +276,23 @@ def main():
 
     async def on_startup(application):
         scheduler.start()
-        # Always delete existing webhook first to avoid conflicts
+        # Delete any existing webhook first
         await application.bot.delete_webhook(drop_pending_updates=True)
-        webhook_url = os.getenv("RENDER_EXTERNAL_URL", "")
-        if webhook_url:
-            await application.bot.set_webhook(f"{webhook_url}/webhook")
-            print(f"Webhook set: {webhook_url}/webhook")
+        # Use hardcoded Render URL
+        webhook_url = os.getenv("RENDER_EXTERNAL_URL", "https://quality-momentum-bot.onrender.com")
+        await application.bot.set_webhook(f"{webhook_url}/webhook")
+        print(f"Webhook set: {webhook_url}/webhook")
         print("Scheduler started — daily scan at 9:30 AM ET (Mon-Fri)")
 
     app.post_init = on_startup
     print("Quality Momentum Bot running!")
-
-    webhook_url = os.getenv("RENDER_EXTERNAL_URL", "")
-    if webhook_url:
-        # Webhook mode — no conflict possible
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=int(os.getenv("PORT", 10000)),
-            webhook_url=f"{webhook_url}/webhook",
-            drop_pending_updates=True,
-        )
-    else:
-        # Fallback to polling for local dev
-        app.run_polling(drop_pending_updates=True)
+    webhook_url = os.getenv("RENDER_EXTERNAL_URL", "https://quality-momentum-bot.onrender.com")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv("PORT", 10000)),
+        webhook_url=f"{webhook_url}/webhook",
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
