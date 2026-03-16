@@ -30,17 +30,13 @@ FINNHUB_KEY   = os.getenv("FINNHUB_KEY", "")
 ALPACA_URL  = "https://data.alpaca.markets/v2"
 FINNHUB_URL = "https://finnhub.io/api/v1"
 
-# ── Bollinger Band settings ───────────────────────────────────────────────────
 BB_PERIOD = 20
 BB_STD    = 2.0
 
 
-# ── Price data via Alpaca ─────────────────────────────────────────────────────
-
-def get_price_data(ticker: str) -> pd.DataFrame | None:
+def get_price_data(ticker):
     end   = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
-
     headers = {
         "APCA-API-KEY-ID":     ALPACA_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET,
@@ -52,14 +48,12 @@ def get_price_data(ticker: str) -> pd.DataFrame | None:
         "limit":     365,
         "feed":      "iex",
     }
-
     try:
         r    = requests.get(f"{ALPACA_URL}/stocks/{ticker}/bars",
                             headers=headers, params=params, timeout=15)
         bars = r.json().get("bars")
         if not bars or len(bars) < 60:
             return None
-
         df = pd.DataFrame([{
             "Date":   pd.to_datetime(b["t"]),
             "Open":   float(b["o"]),
@@ -69,30 +63,24 @@ def get_price_data(ticker: str) -> pd.DataFrame | None:
             "Volume": float(b["v"]),
         } for b in bars])
         return df.sort_values("Date").reset_index(drop=True)
-
     except Exception as e:
         print(f"[{ticker}] Alpaca error: {e}")
         return None
 
 
-# ── Fundamentals via Finnhub ──────────────────────────────────────────────────
-
-def get_fundamentals(ticker: str) -> dict:
+def get_fundamentals(ticker):
     def safe(v, d=0.0):
         try: return float(v) if v not in (None, "", "N/A", "None") else d
         except: return d
-
     try:
         r1 = requests.get(f"{FINNHUB_URL}/stock/metric",
                           params={"symbol": ticker, "metric": "all",
                                   "token": FINNHUB_KEY}, timeout=15)
         m  = r1.json().get("metric", {})
-
         r2 = requests.get(f"{FINNHUB_URL}/stock/profile2",
                           params={"symbol": ticker, "token": FINNHUB_KEY},
                           timeout=15)
         p  = r2.json()
-
         return {
             "roe":          safe(m.get("roeTTM")) / 100,
             "gross_margin": safe(m.get("grossMarginTTM")) / 100,
@@ -108,19 +96,14 @@ def get_fundamentals(ticker: str) -> dict:
         return {}
 
 
-# ── Bollinger Bands ───────────────────────────────────────────────────────────
-
-def compute_bollinger(df: pd.DataFrame) -> pd.DataFrame:
+def compute_bollinger(df):
     df = df.copy()
     close = df["Close"]
-
     df["BB_mid"]   = close.rolling(BB_PERIOD).mean()
     df["BB_std"]   = close.rolling(BB_PERIOD).std()
     df["BB_upper"] = df["BB_mid"] + BB_STD * df["BB_std"]
     df["BB_lower"] = df["BB_mid"] - BB_STD * df["BB_std"]
     df["BB_width"] = (df["BB_upper"] - df["BB_lower"]) / df["BB_mid"]
-
-    # RSI(14)
     delta    = close.diff()
     gain     = delta.clip(lower=0)
     loss     = (-delta).clip(lower=0)
@@ -128,94 +111,63 @@ def compute_bollinger(df: pd.DataFrame) -> pd.DataFrame:
     avg_loss = loss.ewm(com=13, adjust=False).mean()
     rs       = avg_gain / avg_loss.replace(0, float("nan"))
     df["RSI"] = 100 - (100 / (1 + rs))
-
-    # ATR(14)
     high, low = df["High"], df["Low"]
     tr = pd.concat([
         high - low,
         (high - close.shift(1)).abs(),
         (low  - close.shift(1)).abs(),
     ], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(14).mean()
-
-    # Volume average
+    df["ATR"]      = tr.rolling(14).mean()
     df["VolAvg20"] = df["Volume"].rolling(20).mean()
-
-    # SMA200
-    df["SMA200"] = close.rolling(200).mean()
-    df["SMA50"]  = close.rolling(50).mean()
-
+    df["SMA200"]   = close.rolling(200).mean()
+    df["SMA50"]    = close.rolling(50).mean()
     return df
 
 
-# ── 3rd Touch Detection ───────────────────────────────────────────────────────
-
-def find_lower_band_touches(df: pd.DataFrame, lookback: int = 60) -> list:
-    """
-    Find candles where Low touched or breached the lower Bollinger Band.
-    Returns list of indices of touch candles within lookback window.
-    """
-    recent = df.iloc[-lookback:].copy()
+def find_lower_band_touches(df, lookback=60):
+    recent  = df.iloc[-lookback:].copy()
     touches = []
-
     for i in range(len(recent)):
         row = recent.iloc[i]
         if pd.isna(row["BB_lower"]):
             continue
-        # Touch = Low <= lower band (price dipped to or below lower band)
-        if row["Low"] <= row["BB_lower"] * 1.005:  # 0.5% tolerance
+        if row["Low"] <= row["BB_lower"] * 1.005:
             touches.append(recent.index[i])
-
     return touches
 
 
-def is_third_touch_breakout(df: pd.DataFrame) -> dict | None:
-    """
-    Check if the most recent candle is a 3rd touch breakout.
-    Returns signal details or None.
-    """
+def is_third_touch_breakout(df):
     df = compute_bollinger(df)
-
-    # Need at least BB_PERIOD + 10 bars
     if len(df) < BB_PERIOD + 20:
         return None
 
-    # Find all lower band touches in last 60 days
     touches = find_lower_band_touches(df, lookback=60)
-
     if len(touches) < 3:
         return None
 
-    # Get last 3 touches
-    last_3 = touches[-3:]
-
-    # The most recent touch should be within last 5 candles
+    last_3         = touches[-3:]
     last_touch_idx = last_3[-1]
-    bars_since_touch = len(df) - 1 - df.index.get_loc(last_touch_idx)
+    bars_since     = len(df) - 1 - df.index.get_loc(last_touch_idx)
+    if bars_since > 5:
+        return None
 
-    if bars_since_touch > 5:
-        return None  # Touch too old
-
-    # Current candle (today's close)
     current = df.iloc[-1]
     prev    = df.iloc[-2]
 
-    # Breakout confirmation: current close is ABOVE lower band
-    # and previous close was AT or BELOW lower band
     if pd.isna(current["BB_lower"]) or pd.isna(current["BB_mid"]):
+        return None
+
+    # Trend filter: price must be above SMA50 (skip downtrends)
+    if not pd.isna(current["SMA50"]) and current["Close"] < current["SMA50"] * 0.98:
         return None
 
     close_above_lower = current["Close"] > current["BB_lower"]
     was_at_lower      = prev["Low"] <= prev["BB_lower"] * 1.01
-
     if not (close_above_lower and was_at_lower):
-        # Also check if current candle itself is the breakout
-        # (closed above lower band after touching it intraday)
         if not (current["Low"] <= current["BB_lower"] * 1.005 and
                 current["Close"] > current["BB_lower"]):
             return None
 
-    # RSI confirmation: was oversold on touch, now rising
     rsi_now  = current["RSI"]
     rsi_prev = prev["RSI"]
     if pd.isna(rsi_now) or pd.isna(rsi_prev):
@@ -223,20 +175,16 @@ def is_third_touch_breakout(df: pd.DataFrame) -> dict | None:
 
     rsi_rising = rsi_now > rsi_prev
     rsi_ok     = 30 <= rsi_now <= 65
-
     if not (rsi_rising and rsi_ok):
         return None
 
-    # Volume confirmation: breakout candle has above-average volume
-    vol_ratio = current["Volume"] / current["VolAvg20"] if current["VolAvg20"] > 0 else 1.0
-    vol_confirmed = vol_ratio >= 1.15  # 15% above average
+    vol_ratio     = current["Volume"] / current["VolAvg20"] if current["VolAvg20"] > 0 else 1.0
+    vol_confirmed = vol_ratio >= 1.15
 
-    # Touch spacing check: touches should be spread out (not all in 1 day)
     touch_span = df.index.get_loc(last_3[-1]) - df.index.get_loc(last_3[0])
     if touch_span < 5:
-        return None  # All touches too close together = noise
+        return None
 
-    # Stop loss = lowest low of the 3 touches
     stop_low = min(df.loc[idx, "Low"] for idx in last_3)
 
     return {
@@ -257,44 +205,34 @@ def is_third_touch_breakout(df: pd.DataFrame) -> dict | None:
     }
 
 
-# ── Quality screen ────────────────────────────────────────────────────────────
-
-def quality_score(fund: dict) -> tuple[float, list]:
+def quality_score(fund):
     score, failed = 0.0, []
-
     roe = fund.get("roe", 0)
     if roe >= 0.15:   score += 30
     elif roe >= 0.08: score += 15 + (roe - 0.08) / 0.07 * 15
     elif roe > 0:     score += 8
     else:             failed.append(f"ROE {roe:.1%}")
-
     gm = fund.get("gross_margin", 0)
     if gm >= 0.40:   score += 25
     elif gm >= 0.15: score += 10 + (gm - 0.15) / 0.25 * 15
     elif gm > 0:     score += 5
     else:            failed.append(f"Margin {gm:.1%}")
-
     eg = fund.get("eps_growth", 0)
     if eg >= 0.15:  score += 25
     elif eg >= 0.0: score += 10 + eg / 0.15 * 15
     else:           failed.append(f"EPS {eg:.1%}")
-
     de = fund.get("debt_equity", 999)
     if de <= 0.5:    score += 20
     elif de <= 2.0:  score += 20 - (de - 0.5) / 1.5 * 15
     else:            failed.append(f"D/E {de:.1f}")
-
     return round(score, 1), failed
 
 
-# ── Position sizing ───────────────────────────────────────────────────────────
-
-def position_size(price: float, stop: float, account: float = 100_000,
-                  risk_pct: float = 0.01) -> dict:
+def position_size(price, stop, account=100_000, risk_pct=0.01):
     risk_dollars = account * risk_pct
     stop_dist    = price - stop
     if stop_dist <= 0:
-        stop_dist = price * 0.04  # fallback 4% stop
+        stop_dist = price * 0.04
     shares = math.floor(risk_dollars / stop_dist)
     return {
         "shares":       shares,
@@ -305,62 +243,43 @@ def position_size(price: float, stop: float, account: float = 100_000,
     }
 
 
-# ── Signal strength ───────────────────────────────────────────────────────────
-
-def signal_score(bb: dict, q_score: float) -> float:
+def signal_score(bb, q_score):
     score = 0.0
-
-    # Quality (40%)
     score += q_score * 0.40
-
-    # RSI in ideal zone 35-55 on breakout = strong reversal (25%)
     rsi = bb["rsi"]
     if 35 <= rsi <= 55:   score += 25
     elif 55 < rsi <= 65:  score += 15
     else:                 score += 5
-
-    # Volume confirmation (20%)
-    if bb["vol_ratio"] >= 1.5:   score += 20
+    if bb["vol_ratio"] >= 1.5:    score += 20
     elif bb["vol_ratio"] >= 1.15: score += 12
     else:                         score += 5
-
-    # Number of touches (more = stronger pattern) (15%)
     if bb["n_touches"] >= 4:   score += 15
     elif bb["n_touches"] == 3: score += 10
-
     return round(score, 1)
 
 
-# ── Main analyzer ─────────────────────────────────────────────────────────────
-
-def analyze_ticker(ticker: str) -> dict | None:
+def analyze_ticker(ticker):
     try:
-        # 1. Price data
         df = get_price_data(ticker)
         if df is None or len(df) < 40:
             return None
 
-        # 2. Bollinger Band 3rd touch breakout detection
         bb = is_third_touch_breakout(df)
         if bb is None:
             print(f"[{ticker}] No BB 3rd touch breakout")
             return None
 
-        # 3. Fundamentals
         fund = get_fundamentals(ticker)
         if not fund:
             return None
 
-        # 4. Quality score
         q_score, failed = quality_score(fund)
         if q_score < 20:
             print(f"[{ticker}] SKIP | Quality {q_score:.0f}")
             return None
 
-        # 5. Signal score
         sig = signal_score(bb, q_score)
 
-        # 6. Hold time based on signal strength
         if sig >= 70:
             hold_time = "POSITION (3-8 weeks)"
         elif sig >= 45:
@@ -369,13 +288,11 @@ def analyze_ticker(ticker: str) -> dict | None:
             print(f"[{ticker}] SKIP | Signal too weak {sig:.0f}")
             return None
 
-        # 7. Risk management
         price  = bb["close"]
-        stop   = bb["stop_low"] * 0.99  # 1% below lowest touch
+        stop   = bb["stop_low"] * 0.99
         sizing = position_size(price, stop)
-
-        tp1 = round(bb["bb_mid"], 2)    # Target 1 = middle band
-        tp2 = round(bb["bb_upper"], 2)  # Target 2 = upper band
+        tp1    = round(bb["bb_mid"], 2)
+        tp2    = round(bb["bb_upper"], 2)
         tp1_pct = round((tp1 - price) / price * 100, 1)
         tp2_pct = round((tp2 - price) / price * 100, 1)
 
@@ -387,13 +304,11 @@ def analyze_ticker(ticker: str) -> dict | None:
             "hold_time":     hold_time,
             "signal_score":  sig,
             "quality_score": q_score,
-            # Price
             "price":         round(price, 2),
             "sma200":        round(bb["sma200"], 2) if bb["sma200"] else None,
             "sma50":         round(bb["sma50"], 2)  if bb["sma50"]  else None,
             "rsi":           round(bb["rsi"], 1),
             "atr":           round(bb["atr"], 2),
-            # Bollinger
             "bb_lower":      round(bb["bb_lower"], 2),
             "bb_mid":        round(bb["bb_mid"], 2),
             "bb_upper":      round(bb["bb_upper"], 2),
@@ -401,7 +316,6 @@ def analyze_ticker(ticker: str) -> dict | None:
             "n_touches":     bb["n_touches"],
             "vol_ratio":     round(bb["vol_ratio"], 2),
             "vol_confirmed": bb["vol_confirmed"],
-            # Fundamentals
             "roe":           round(fund.get("roe", 0) * 100, 1),
             "gross_margin":  round(fund.get("gross_margin", 0) * 100, 1),
             "eps_growth":    round(fund.get("eps_growth", 0) * 100, 1),
@@ -409,7 +323,6 @@ def analyze_ticker(ticker: str) -> dict | None:
             "pe_ratio":      round(fund.get("pe_ratio", 0), 1),
             "sector":        fund.get("sector", ""),
             "name":          fund.get("name", ticker),
-            # Risk
             "stop":          sizing["stop"],
             "tp1":           tp1,
             "tp2":           tp2,
