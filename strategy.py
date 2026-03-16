@@ -10,7 +10,7 @@ Logic:
   4. RSI turning up from oversold
   5. Volume spike on breakout candle
   6. Stop: 1.5x ATR below entry
-  7. Targets: Fibonacci 38.2% / 61.8% / 100% retracement of last swing
+  7. Targets: Fibonacci 38.2% / 61.8% / 100% retracement
 
 Timeframe: Daily bars
 Data: Alpaca (price) + Finnhub (fundamentals)
@@ -33,8 +33,8 @@ FINNHUB_URL = "https://finnhub.io/api/v1"
 BB_PERIOD = 20
 BB_STD    = 2.0
 
-ACCOUNT   = 1_000
-RISK_PCT  = 0.10
+ACCOUNT  = 1_000
+RISK_PCT = 0.10
 
 
 def get_price_data(ticker):
@@ -139,20 +139,32 @@ def find_lower_band_touches(df, lookback=60):
     return touches
 
 
-def compute_fibonacci(df, lookback=60):
+def compute_fibonacci(df, touches):
     """
-    Find swing high and swing low over lookback period.
-    Returns Fibonacci retracement levels from low to high.
-    38.2%, 61.8%, 100% retracements = TP1, TP2, TP3
+    Swing low  = lowest low among the BB touches.
+    Swing high = highest high in the 60 bars BEFORE the first touch.
+    This ensures targets are always above the current entry price.
     """
-    recent    = df.iloc[-lookback:]
-    swing_low  = float(recent["Low"].min())
-    swing_high = float(recent["High"].max())
-    diff       = swing_high - swing_low
+    if not touches:
+        return None
+
+    swing_low = min(float(df.loc[idx, "Low"]) for idx in touches)
+
+    first_touch_loc = df.index.get_loc(touches[0])
+    lookback_start  = max(0, first_touch_loc - 60)
+    swing_high      = float(df.iloc[lookback_start:first_touch_loc]["High"].max())
+
+    current_price = float(df.iloc[-1]["Close"])
+    if swing_high <= current_price:
+        bb_upper   = float(df.iloc[-1]["BB_upper"])
+        diff       = bb_upper - swing_low
+        swing_high = swing_low + diff * 1.5
+
+    diff = swing_high - swing_low
 
     return {
-        "swing_low":  swing_low,
-        "swing_high": swing_high,
+        "swing_low":  round(swing_low, 2),
+        "swing_high": round(swing_high, 2),
         "fib_382":    round(swing_low + diff * 0.382, 2),
         "fib_618":    round(swing_low + diff * 0.618, 2),
         "fib_100":    round(swing_high, 2),
@@ -209,7 +221,10 @@ def is_third_touch_breakout(df):
         return None
 
     stop_low = min(df.loc[idx, "Low"] for idx in last_3)
-    fib      = compute_fibonacci(df, lookback=60)
+
+    fib = compute_fibonacci(df, last_3)
+    if fib is None:
+        return None
 
     return {
         "close":         float(current["Close"]),
@@ -325,7 +340,6 @@ def analyze_ticker(ticker):
         stop       = max(atr_stop, touch_stop)
         sizing     = position_size(price, stop)
 
-        # Fibonacci targets
         tp1     = bb["fib_382"]
         tp2     = bb["fib_618"]
         tp3     = bb["fib_100"]
@@ -333,13 +347,11 @@ def analyze_ticker(ticker):
         tp2_pct = round((tp2 - price) / price * 100, 1)
         tp3_pct = round((tp3 - price) / price * 100, 1)
 
-        # R:R ratios
-        risk    = price - stop
-        rr_tp1  = round((tp1 - price) / risk, 2) if risk > 0 else 0
-        rr_tp2  = round((tp2 - price) / risk, 2) if risk > 0 else 0
-        rr_tp3  = round((tp3 - price) / risk, 2) if risk > 0 else 0
+        risk   = price - stop
+        rr_tp1 = round((tp1 - price) / risk, 2) if risk > 0 else 0
+        rr_tp2 = round((tp2 - price) / risk, 2) if risk > 0 else 0
+        rr_tp3 = round((tp3 - price) / risk, 2) if risk > 0 else 0
 
-        # Skip if R:R at TP2 is below 1.5
         if rr_tp2 < 1.5:
             print(f"[{ticker}] SKIP | R:R too low {rr_tp2:.2f}x at TP2")
             return None
