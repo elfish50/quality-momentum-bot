@@ -310,13 +310,3 @@ if __name__ == "__main__":
     main()
 ```
 
-Then add `aiohttp` to `requirements.txt` on GitHub:
-```
-python-telegram-bot[webhooks]==21.9
-apscheduler==3.10.4
-python-dotenv==1.0.0
-requests==2.31.0
-pandas==2.2.3
-numpy==1.26.4
-beautifulsoup4==4.12.3
-aiohttp==3.9.5
