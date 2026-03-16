@@ -8,7 +8,6 @@ import json
 import os
 import traceback
 from datetime import datetime
-from threading import Thread
 
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -30,16 +29,10 @@ async def scheduled_scan(bot):
 # ── Webhook trigger (for cron-job.org) ───────────────────────────────────────
 
 async def handle_trigger(request):
-    """
-    cron-job.org hits GET /trigger?secret=YOUR_SECRET
-    Bot triggers the scan and returns 200.
-    """
     secret   = os.getenv("CRON_SECRET", "")
     incoming = request.rel_url.query.get("secret", "")
-
     if secret and incoming != secret:
         return web.Response(status=403, text="Forbidden")
-
     app = request.app["bot_app"]
     asyncio.create_task(scheduled_scan(app.bot))
     print(f"[trigger] Scan triggered via webhook at {datetime.now().strftime('%H:%M')}")
@@ -131,22 +124,22 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         loop = asyncio.get_event_loop()
         sig  = await loop.run_in_executor(None, lambda: analyze_ticker(ticker))
-       if sig:
+        if sig:
             await update.message.reply_text(format_alert(sig))
         else:
             await update.message.reply_text(
                 f"{ticker} — no signal\n"
                 f"==============================\n"
                 f"Common reasons:\n"
-                f"  • Price below SMA50 (downtrend)\n"
-                f"  • Last BB touch > 5 bars ago\n"
-                f"  • RSI falling or out of range\n"
-                f"  • R:R below 1.5x at TP2\n"
-                f"  • Quality screen failed\n\n"
-                f"Try /check on a stock that is:\n"
-                f"  • Above its 50-day average\n"
-                f"  • Near its lower Bollinger Band\n"
-                f"  • RSI between 30-65 and rising"
+                f"  - Price below SMA50 (downtrend)\n"
+                f"  - Last BB touch more than 5 bars ago\n"
+                f"  - RSI falling or out of range\n"
+                f"  - R:R below 1.5x at TP2\n"
+                f"  - Quality screen failed\n\n"
+                f"Try checking a stock that is:\n"
+                f"  - Above its 50-day average\n"
+                f"  - Near its lower Bollinger Band\n"
+                f"  - RSI between 30-65 and rising"
             )
     except Exception:
         await update.message.reply_text(f"Error:\n{traceback.format_exc()[-400:]}")
@@ -227,8 +220,8 @@ async def cmd_universe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     from universe import load_universe
     await update.message.reply_text("Checking universe...")
     try:
-        u      = load_universe()
-        all_t  = u.get("ALL", [])
+        u     = load_universe()
+        all_t = u.get("ALL", [])
         await update.message.reply_text(
             f"Universe Status\n"
             f"==============================\n"
@@ -298,7 +291,6 @@ def main():
         await application.bot.delete_webhook(drop_pending_updates=True)
         print("Scheduler started — daily scan at 9:30 AM ET (Mon-Fri)")
 
-        # Start aiohttp webhook trigger server
         web_app = web.Application()
         web_app["bot_app"] = application
         web_app.router.add_get("/trigger", handle_trigger)
