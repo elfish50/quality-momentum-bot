@@ -1,110 +1,140 @@
 """
-universe.py
-Loads NASDAQ + NYSE ticker lists with 24h cache.
-Hardcoded fallbacks if APIs fail.
+UNIVERSE LOADER
+Fetches all active, tradeable US equity tickers from Alpaca's /v2/assets endpoint.
+Covers Nasdaq, NYSE, NYSE Arca, NYSE American — no extra API key needed.
+
+Filters applied:
+  - status == "active"
+  - tradable == True
+  - asset_class == "us_equity"
+  - exchange in (NASDAQ, NYSE, NYSE ARCA, NYSE AMERICAN)
+  - no OTC / pink sheets
+  - symbol is clean (letters only, no dots/slashes = no preferred shares or warrants)
+
+Result is cached to disk for 24h so we don't hammer Alpaca on every run.
 """
-import json
+
 import os
+import json
 import time
-import pandas as pd
 import requests
+from datetime import datetime, timedelta
+from pathlib import Path
 
-CACHE_FILE        = "universe_cache.json"
-CACHE_MAX_AGE_HRS = 24
+ALPACA_KEY    = os.getenv("ALPACA_KEY", "")
+ALPACA_SECRET = os.getenv("ALPACA_SECRET", "")
+ALPACA_URL    = "https://paper-api.alpaca.markets/v2"   # assets endpoint works on paper too
 
-SP500_FALLBACK = [
-    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","AVGO","JPM",
-    "LLY","V","UNH","XOM","MA","COST","HD","PG","WMT","NFLX","BAC","ABBV",
-    "CRM","CVX","MRK","KO","ADBE","AMD","PEP","TMO","ACN","MCD","ABT","CSCO",
-    "GE","DHR","TXN","CAT","INTU","WFC","AXP","MS","GS","BLK","SPGI","MMC",
-    "RTX","HON","LMT","UPS","DE","NOC","GD","NEE","DUK","JNJ","PFE","AMGN",
-    "GILD","VRTX","REGN","ISRG","SYK","MDT","LOW","TGT","BKNG","SBUX","NKE",
-    "TJX","ORLY","PANW","CRWD","FTNT","NOW","WDAY","SNOW","QCOM","AMAT","LRCX",
-    "KLAC","MRVL","SNPS","CDNS","AMT","PLD","CCI","EQIX","PSA","LIN","APD",
-    "ECL","SHW","NEM","FCX","UNP","CSX","NSC","SCHW","COF","SYF","BMY","ELV",
-]
+CACHE_FILE    = Path(".universe_cache.json")
+CACHE_TTL_H   = 24   # hours before refreshing
 
-NASDAQ_FALLBACK = [
-    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AVGO","COST","NFLX",
-    "AMD","ADBE","QCOM","INTC","CSCO","INTU","AMAT","LRCX","KLAC","SNPS",
-    "CDNS","MRVL","PANW","FTNT","CRWD","ZS","DDOG","SNOW","MDB","NET",
-    "HUBS","TEAM","WDAY","NOW","ABNB","UBER","RBLX","COIN","PYPL","SHOP",
-    "MELI","BKNG","VRSK","IDXX","ILMN","BIIB","VRTX","REGN","GILD","AMGN",
-    "MRNA","ISRG","FAST","ODFL","PCAR","CPRT","CSGP","ANSS","TTWO","EA",
-    "LULU","MNST","MDLZ","PEP","DLTR","ROST","ORLY","TSCO","NXPI","ADI",
-    "MPWR","FSLR","SOFI","HOOD","AFRM","UPST","ZM","DOCU","TWLO","VEEV",
-]
+VALID_EXCHANGES = {"NASDAQ", "NYSE", "NYSE ARCA", "NYSE AMERICAN"}
 
-NYSE_FALLBACK = [
-    "JPM","BAC","WFC","GS","MS","C","BLK","AXP","V","MA","BRK-B","JNJ",
-    "UNH","PFE","ABT","TMO","DHR","SYK","MDT","BSX","XOM","CVX","COP",
-    "SLB","EOG","MPC","VLO","PSX","OXY","WMT","HD","LOW","TGT","KO","PEP",
-    "MCD","SBUX","NKE","DIS","T","VZ","NEE","DUK","SO","D","AEP","EXC",
-    "BA","CAT","GE","HON","MMM","RTX","LMT","NOC","GD","UPS","FDX","CSX",
-    "UNP","NSC","DE","EMR","ETN","PG","CL","KMB","LIN","APD","ECL","SHW",
-    "NEM","FCX","NUE","AMT","PLD","CCI","EQIX","PSA","O","SPG","SCHW",
-    "COF","DFS","AIG","MET","PRU","AFL","CVS","ELV","CI","HUM","MCK","IBM",
-    "DAL","UAL","AAL","LUV","CCL","RCL","MAR","HLT","F","GM",
-]
+MIN_PRICE     = 5.0    # skip penny stocks
+MAX_PRICE     = 5000.0 # skip extreme outliers
 
 
-def _valid(t):
-    return bool(t) and len(t) <= 6 and all(c.isalpha() or c == "-" for c in t)
+# ── Fetch from Alpaca ─────────────────────────────────────────────────────────
+
+def _fetch_assets() -> list[dict]:
+    headers = {
+        "APCA-API-KEY-ID":     ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+    params = {
+        "status":      "active",
+        "asset_class": "us_equity",
+    }
+
+    print("[universe] Fetching asset list from Alpaca...")
+    r = requests.get(
+        f"{ALPACA_URL}/assets",
+        headers=headers,
+        params=params,
+        timeout=30,
+    )
+    r.raise_for_status()
+    assets = r.json()
+    print(f"[universe] Raw assets returned: {len(assets)}")
+    return assets
 
 
-def _fetch_nasdaq_api(exchange: str) -> list:
+def _is_clean_symbol(sym: str) -> bool:
+    """Only plain ticker symbols — no dots, slashes, or numbers (warrants/preferreds)."""
+    return sym.isalpha() and len(sym) <= 5
+
+
+# ── Filter ────────────────────────────────────────────────────────────────────
+
+def _filter_assets(assets: list[dict]) -> list[str]:
+    tickers = []
+    for a in assets:
+        if not a.get("tradable"):
+            continue
+        if a.get("exchange", "") not in VALID_EXCHANGES:
+            continue
+        sym = a.get("symbol", "")
+        if not _is_clean_symbol(sym):
+            continue
+        tickers.append(sym)
+
+    tickers = sorted(set(tickers))
+    print(f"[universe] After filter: {len(tickers)} tickers")
+    return tickers
+
+
+# ── Cache ─────────────────────────────────────────────────────────────────────
+
+def _load_cache() -> list[str] | None:
+    if not CACHE_FILE.exists():
+        return None
     try:
-        url     = f"https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=5000&exchange={exchange}"
-        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json",
-                   "Referer": "https://www.nasdaq.com/"}
-        r    = requests.get(url, headers=headers, timeout=15)
-        rows = r.json()["data"]["table"]["rows"]
-        t    = [row["symbol"].strip() for row in rows if row.get("symbol")]
-        t    = [x for x in t if _valid(x)]
-        if len(t) > 100:
-            print(f"  {exchange}: {len(t)} tickers (API)")
-            return t
-    except Exception as e:
-        print(f"  {exchange} API failed: {e}")
-    return []
+        data = json.loads(CACHE_FILE.read_text())
+        cached_at = datetime.fromisoformat(data["cached_at"])
+        if datetime.now() - cached_at < timedelta(hours=CACHE_TTL_H):
+            tickers = data["tickers"]
+            print(f"[universe] Loaded {len(tickers)} tickers from cache (expires in "
+                  f"{CACHE_TTL_H - int((datetime.now()-cached_at).total_seconds()/3600)}h)")
+            return tickers
+        print("[universe] Cache expired, refreshing...")
+    except Exception:
+        pass
+    return None
 
 
-def build_universe() -> dict:
-    print("Building universe...")
-    nasdaq = _fetch_nasdaq_api("NASDAQ") or NASDAQ_FALLBACK
-    nyse   = _fetch_nasdaq_api("NYSE")   or NYSE_FALLBACK
-
-    # SP500 via Wikipedia
-    sp500 = []
-    try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", timeout=10)
-        sp500  = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
-        sp500  = [t for t in sp500 if _valid(t)]
-        print(f"  SP500: {len(sp500)} tickers (Wikipedia)")
-    except Exception as e:
-        print(f"  SP500 Wikipedia failed: {e}")
-        sp500 = SP500_FALLBACK
-
-    all_tickers = sorted(set(nasdaq + nyse + sp500))
-    universe = {"NASDAQ": nasdaq, "NYSE": nyse, "SP500": sp500, "ALL": all_tickers}
-    print(f"Total unique: {len(all_tickers)}")
-    return universe
+def _save_cache(tickers: list[str]):
+    CACHE_FILE.write_text(json.dumps({
+        "cached_at": datetime.now().isoformat(),
+        "tickers":   tickers,
+    }, indent=2))
+    print(f"[universe] Cached {len(tickers)} tickers to {CACHE_FILE}")
 
 
-def load_universe(force_refresh=False) -> dict:
-    if not force_refresh and os.path.exists(CACHE_FILE):
-        age = (time.time() - os.path.getmtime(CACHE_FILE)) / 3600
-        if age < CACHE_MAX_AGE_HRS:
-            with open(CACHE_FILE) as f:
-                cached = json.load(f)
-            if len(cached.get("ALL", [])) > 0:
-                print(f"Universe from cache: {len(cached['ALL'])} tickers")
-                return cached
-    u = build_universe()
-    with open(CACHE_FILE, "w") as f:
-        json.dump(u, f)
-    return u
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def get_universe(force_refresh: bool = False) -> list[str]:
+    """
+    Returns list of clean, tradeable US equity tickers.
+    Uses 24h disk cache to avoid hammering Alpaca.
+    """
+    if not force_refresh:
+        cached = _load_cache()
+        if cached:
+            return cached
+
+    assets  = _fetch_assets()
+    tickers = _filter_assets(assets)
+    _save_cache(tickers)
+    return tickers
 
 
-def get_all_tickers() -> list:
-    return load_universe().get("ALL", [])
+def get_universe_batched(batch_size: int = 500) -> list[list[str]]:
+    """Returns universe split into batches for parallel processing."""
+    tickers = get_universe()
+    return [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
+
+
+if __name__ == "__main__":
+    tickers = get_universe(force_refresh=True)
+    print(f"\nTotal tickers ready to scan: {len(tickers)}")
+    print("Sample:", tickers[:20])
