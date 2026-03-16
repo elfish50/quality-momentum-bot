@@ -8,7 +8,7 @@ Logic:
   3. 3rd touch: candle closes BACK ABOVE lower band (breakout confirmation)
   4. RSI turning up from oversold (< 45 on touch, rising on breakout)
   5. Volume spike on breakout candle (real buying)
-  6. Stop: below 3rd touch low | TP1: middle band | TP2: upper band
+  6. Stop: 1.5x ATR below entry | TP1: middle band | TP2: upper band
 
 Timeframe: Daily bars
 Data: Alpaca (price) + Finnhub (fundamentals)
@@ -16,10 +16,8 @@ Data: Alpaca (price) + Finnhub (fundamentals)
 
 import os
 import math
-import time
 import traceback
 import pandas as pd
-import numpy as np
 import requests
 from datetime import datetime, timedelta
 
@@ -97,7 +95,7 @@ def get_fundamentals(ticker):
 
 
 def compute_bollinger(df):
-    df = df.copy()
+    df    = df.copy()
     close = df["Close"]
     df["BB_mid"]   = close.rolling(BB_PERIOD).mean()
     df["BB_std"]   = close.rolling(BB_PERIOD).std()
@@ -110,8 +108,8 @@ def compute_bollinger(df):
     avg_gain = gain.ewm(com=13, adjust=False).mean()
     avg_loss = loss.ewm(com=13, adjust=False).mean()
     rs       = avg_gain / avg_loss.replace(0, float("nan"))
-    df["RSI"] = 100 - (100 / (1 + rs))
-    high, low = df["High"], df["Low"]
+    df["RSI"]      = 100 - (100 / (1 + rs))
+    high, low      = df["High"], df["Low"]
     tr = pd.concat([
         high - low,
         (high - close.shift(1)).abs(),
@@ -232,7 +230,7 @@ def position_size(price, stop, account=100_000, risk_pct=0.01):
     risk_dollars = account * risk_pct
     stop_dist    = price - stop
     if stop_dist <= 0:
-        stop_dist = price * 0.04
+        stop_dist = price * 0.02
     shares = math.floor(risk_dollars / stop_dist)
     return {
         "shares":       shares,
@@ -288,15 +286,19 @@ def analyze_ticker(ticker):
             print(f"[{ticker}] SKIP | Signal too weak {sig:.0f}")
             return None
 
-        price  = bb["close"]
-        stop   = bb["stop_low"] * 0.99
-        sizing = position_size(price, stop)
-        tp1    = round(bb["bb_mid"], 2)
-        tp2    = round(bb["bb_upper"], 2)
-        tp1_pct = round((tp1 - price) / price * 100, 1)
-        tp2_pct = round((tp2 - price) / price * 100, 1)
+        price      = bb["close"]
+        atr_stop   = price - (bb["atr"] * 1.5)
+        touch_stop = bb["stop_low"] * 0.99
+        stop       = max(atr_stop, touch_stop)
+        sizing     = position_size(price, stop)
+        tp1        = round(bb["bb_mid"], 2)
+        tp2        = round(bb["bb_upper"], 2)
+        tp1_pct    = round((tp1 - price) / price * 100, 1)
+        tp2_pct    = round((tp2 - price) / price * 100, 1)
+        rr_tp1     = round((tp1 - price) / (price - stop), 2) if price > stop else 0
+        rr_tp2     = round((tp2 - price) / (price - stop), 2) if price > stop else 0
 
-        print(f"[{ticker}] BUY | Score {sig:.0f} | {hold_time} | RSI {bb['rsi']:.0f} | {bb['n_touches']} touches | Vol {bb['vol_ratio']:.1f}x")
+        print(f"[{ticker}] BUY | Score {sig:.0f} | {hold_time} | RSI {bb['rsi']:.0f} | {bb['n_touches']} touches | Vol {bb['vol_ratio']:.1f}x | R:R {rr_tp2:.1f}x")
 
         return {
             "ticker":        ticker,
@@ -328,6 +330,8 @@ def analyze_ticker(ticker):
             "tp2":           tp2,
             "tp1_pct":       tp1_pct,
             "tp2_pct":       tp2_pct,
+            "rr_tp1":        rr_tp1,
+            "rr_tp2":        rr_tp2,
             "shares":        sizing["shares"],
             "risk_dollars":  sizing["risk_dollars"],
             "position_val":  sizing["position_val"],
