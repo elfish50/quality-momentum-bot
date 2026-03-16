@@ -1,27 +1,23 @@
 """
 scanner.py — Quality Momentum Scanner
-Uses Financial Modeling Prep (FMP) for price + fundamental data.
-Free tier: 250 calls/day = ~125 stocks per scan (2 calls each).
+Uses Alpaca (price) + Finnhub (fundamentals).
 """
 import gc
 import time
 import asyncio
 import traceback
 from datetime import datetime
-
 from universe import get_all_tickers
 from strategy import analyze_ticker
 
 BATCH_SIZE  = 10
-BATCH_DELAY = 12   # 250 calls/day = ~10 calls/min safely
-MAX_STOCKS  = 120  # stay under 250 calls/day limit
+BATCH_DELAY = 1
+MAX_STOCKS  = 500
 
 
-def run_scan(tickers: list = None) -> tuple[list, float]:
+def run_scan(tickers: list = None) -> tuple:
     start   = time.time()
     tickers = tickers or get_all_tickers()
-
-    # Limit to SP500 quality stocks for full scans
     tickers = tickers[:MAX_STOCKS]
     alerts  = []
 
@@ -32,7 +28,7 @@ def run_scan(tickers: list = None) -> tuple[list, float]:
             sig = analyze_ticker(ticker)
             if sig:
                 alerts.append(sig)
-                print(f"[ALERT] BUY {ticker} | Score {sig['signal_score']}")
+                print(f"[ALERT] BUY {ticker} | Score {sig['signal_score']} | R:R {sig.get('rr_tp2', 0):.1f}x")
         except Exception:
             pass
         finally:
@@ -92,9 +88,10 @@ def format_alert(sig: dict) -> str:
         f"",
         f"--- Risk Management (1% rule) ---",
         f"Entry:    ${sig['price']:.2f}",
-        f"Stop:     ${sig['stop']:.2f}  (below 3rd touch low)",
-        f"Target 1: ${sig['tp1']:.2f}  (+{sig['tp1_pct']:.1f}% — middle band)",
-        f"Target 2: ${sig['tp2']:.2f}  (+{sig['tp2_pct']:.1f}% — upper band)",
+        f"Stop:     ${sig['stop']:.2f}  (1.5x ATR below entry)",
+        f"Target 1: ${sig['tp1']:.2f}  ({sig['tp1_pct']:+.1f}% — middle band)",
+        f"Target 2: ${sig['tp2']:.2f}  ({sig['tp2_pct']:+.1f}% — upper band)",
+        f"R:R TP1:  {sig.get('rr_tp1', 0):.2f}x  |  R:R TP2: {sig.get('rr_tp2', 0):.2f}x",
         f"Shares:   {sig['shares']}  (${sig['position_val']:,.0f}  {sig['pct_account']:.1f}% of $100k)",
         f"Max loss: ${sig['risk_dollars']:.0f}",
         f"{'='*36}",
@@ -123,11 +120,11 @@ def format_summary(alerts: list, elapsed: float, universe_size: int) -> str:
     if positions:
         msg += f"\nTop POSITION setups:\n"
         for a in positions[:5]:
-            msg += f"  {a['ticker']} | Score {a['signal_score']:.0f} | {a['n_touches']} touches | RSI {a['rsi']:.0f} | Vol {a['vol_ratio']:.1f}x\n"
+            msg += f"  {a['ticker']} | Score {a['signal_score']:.0f} | {a['n_touches']} touches | RSI {a['rsi']:.0f} | Vol {a['vol_ratio']:.1f}x | R:R {a.get('rr_tp2',0):.1f}x\n"
     if swings:
         msg += f"\nTop SWING setups:\n"
         for a in swings[:5]:
-            msg += f"  {a['ticker']} | Score {a['signal_score']:.0f} | {a['n_touches']} touches | RSI {a['rsi']:.0f} | +{a['tp1_pct']:.1f}% to TP1\n"
+            msg += f"  {a['ticker']} | Score {a['signal_score']:.0f} | {a['n_touches']} touches | RSI {a['rsi']:.0f} | R:R {a.get('rr_tp2',0):.1f}x\n"
     return msg
 
 
@@ -139,8 +136,7 @@ async def run_universe_scan(bot, chat_id: str, tickers: list = None):
         universe_size = len(tickers)
     else:
         u         = load_universe()
-        sp500     = u.get("SP500", [])
-        scan_list = sp500[:MAX_STOCKS]
+        scan_list = u.get("ALL", [])[:MAX_STOCKS]
         universe_size = len(scan_list)
 
     await bot.send_message(
@@ -148,8 +144,8 @@ async def run_universe_scan(bot, chat_id: str, tickers: list = None):
         text=(
             f"Quality Momentum Scan starting...\n"
             f"Scanning {universe_size} tickers\n"
-            f"Data: Financial Modeling Prep (250 calls/day)\n"
-            f"Est. time: {universe_size * 2 // 60 + 1}-{universe_size * 3 // 60 + 2} min"
+            f"Data: Alpaca + Finnhub\n"
+            f"Est. time: ~{universe_size // 60 + 1} min"
         )
     )
 
@@ -171,7 +167,7 @@ async def run_universe_scan(bot, chat_id: str, tickers: list = None):
     if not alerts:
         await bot.send_message(
             chat_id=chat_id,
-            text="No stocks passed all filters today.\nTry /check AAPL to test a specific stock."
+            text="No stocks passed all filters today.\nTry /check AMT to test a specific stock."
         )
         return
 
