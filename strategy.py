@@ -1,14 +1,16 @@
 """
 BOLLINGER BAND 3RD TOUCH BREAKOUT STRATEGY
 + Berkshire Quality Screen
++ Fibonacci Retracement Targets
 
 Logic:
   1. Quality company (ROE, margins, EPS growth)
   2. Price touches lower Bollinger Band 3 times
-  3. 3rd touch: candle closes BACK ABOVE lower band (breakout confirmation)
-  4. RSI turning up from oversold (< 45 on touch, rising on breakout)
-  5. Volume spike on breakout candle (real buying)
-  6. Stop: 1.5x ATR below entry | TP1: middle band | TP2: upper band
+  3. 3rd touch: candle closes BACK ABOVE lower band
+  4. RSI turning up from oversold
+  5. Volume spike on breakout candle
+  6. Stop: 1.5x ATR below entry
+  7. Targets: Fibonacci 38.2% / 61.8% / 100% retracement of last swing
 
 Timeframe: Daily bars
 Data: Alpaca (price) + Finnhub (fundamentals)
@@ -30,6 +32,9 @@ FINNHUB_URL = "https://finnhub.io/api/v1"
 
 BB_PERIOD = 20
 BB_STD    = 2.0
+
+ACCOUNT   = 1_000
+RISK_PCT  = 0.10
 
 
 def get_price_data(ticker):
@@ -134,6 +139,26 @@ def find_lower_band_touches(df, lookback=60):
     return touches
 
 
+def compute_fibonacci(df, lookback=60):
+    """
+    Find swing high and swing low over lookback period.
+    Returns Fibonacci retracement levels from low to high.
+    38.2%, 61.8%, 100% retracements = TP1, TP2, TP3
+    """
+    recent    = df.iloc[-lookback:]
+    swing_low  = float(recent["Low"].min())
+    swing_high = float(recent["High"].max())
+    diff       = swing_high - swing_low
+
+    return {
+        "swing_low":  swing_low,
+        "swing_high": swing_high,
+        "fib_382":    round(swing_low + diff * 0.382, 2),
+        "fib_618":    round(swing_low + diff * 0.618, 2),
+        "fib_100":    round(swing_high, 2),
+    }
+
+
 def is_third_touch_breakout(df):
     df = compute_bollinger(df)
     if len(df) < BB_PERIOD + 20:
@@ -155,7 +180,7 @@ def is_third_touch_breakout(df):
     if pd.isna(current["BB_lower"]) or pd.isna(current["BB_mid"]):
         return None
 
-    # Trend filter: price must be above SMA50 (skip downtrends)
+    # Trend filter: price must be above SMA50
     if not pd.isna(current["SMA50"]) and current["Close"] < current["SMA50"] * 0.98:
         return None
 
@@ -184,6 +209,7 @@ def is_third_touch_breakout(df):
         return None
 
     stop_low = min(df.loc[idx, "Low"] for idx in last_3)
+    fib      = compute_fibonacci(df, lookback=60)
 
     return {
         "close":         float(current["Close"]),
@@ -200,6 +226,11 @@ def is_third_touch_breakout(df):
         "sma50":         float(current["SMA50"])  if not pd.isna(current["SMA50"])  else None,
         "n_touches":     len(touches),
         "touch_span":    touch_span,
+        "fib_382":       fib["fib_382"],
+        "fib_618":       fib["fib_618"],
+        "fib_100":       fib["fib_100"],
+        "swing_low":     fib["swing_low"],
+        "swing_high":    fib["swing_high"],
     }
 
 
@@ -226,18 +257,20 @@ def quality_score(fund):
     return round(score, 1), failed
 
 
-def position_size(price, stop, account=100_000, risk_pct=0.01):
-    risk_dollars = account * risk_pct
+def position_size(price, stop):
+    risk_dollars = ACCOUNT * RISK_PCT
     stop_dist    = price - stop
     if stop_dist <= 0:
         stop_dist = price * 0.02
     shares = math.floor(risk_dollars / stop_dist)
+    if shares < 1:
+        shares = 1
     return {
         "shares":       shares,
         "stop":         round(stop, 2),
         "risk_dollars": round(risk_dollars, 2),
         "position_val": round(shares * price, 2),
-        "pct_account":  round(shares * price / account * 100, 1),
+        "pct_account":  round(shares * price / ACCOUNT * 100, 1),
     }
 
 
@@ -291,12 +324,25 @@ def analyze_ticker(ticker):
         touch_stop = bb["stop_low"] * 0.99
         stop       = max(atr_stop, touch_stop)
         sizing     = position_size(price, stop)
-        tp1        = round(bb["bb_mid"], 2)
-        tp2        = round(bb["bb_upper"], 2)
-        tp1_pct    = round((tp1 - price) / price * 100, 1)
-        tp2_pct    = round((tp2 - price) / price * 100, 1)
-        rr_tp1     = round((tp1 - price) / (price - stop), 2) if price > stop else 0
-        rr_tp2     = round((tp2 - price) / (price - stop), 2) if price > stop else 0
+
+        # Fibonacci targets
+        tp1     = bb["fib_382"]
+        tp2     = bb["fib_618"]
+        tp3     = bb["fib_100"]
+        tp1_pct = round((tp1 - price) / price * 100, 1)
+        tp2_pct = round((tp2 - price) / price * 100, 1)
+        tp3_pct = round((tp3 - price) / price * 100, 1)
+
+        # R:R ratios
+        risk    = price - stop
+        rr_tp1  = round((tp1 - price) / risk, 2) if risk > 0 else 0
+        rr_tp2  = round((tp2 - price) / risk, 2) if risk > 0 else 0
+        rr_tp3  = round((tp3 - price) / risk, 2) if risk > 0 else 0
+
+        # Skip if R:R at TP2 is below 1.5
+        if rr_tp2 < 1.5:
+            print(f"[{ticker}] SKIP | R:R too low {rr_tp2:.2f}x at TP2")
+            return None
 
         print(f"[{ticker}] BUY | Score {sig:.0f} | {hold_time} | RSI {bb['rsi']:.0f} | {bb['n_touches']} touches | Vol {bb['vol_ratio']:.1f}x | R:R {rr_tp2:.1f}x")
 
@@ -318,6 +364,8 @@ def analyze_ticker(ticker):
             "n_touches":     bb["n_touches"],
             "vol_ratio":     round(bb["vol_ratio"], 2),
             "vol_confirmed": bb["vol_confirmed"],
+            "swing_low":     bb["swing_low"],
+            "swing_high":    bb["swing_high"],
             "roe":           round(fund.get("roe", 0) * 100, 1),
             "gross_margin":  round(fund.get("gross_margin", 0) * 100, 1),
             "eps_growth":    round(fund.get("eps_growth", 0) * 100, 1),
@@ -328,10 +376,13 @@ def analyze_ticker(ticker):
             "stop":          sizing["stop"],
             "tp1":           tp1,
             "tp2":           tp2,
+            "tp3":           tp3,
             "tp1_pct":       tp1_pct,
             "tp2_pct":       tp2_pct,
+            "tp3_pct":       tp3_pct,
             "rr_tp1":        rr_tp1,
             "rr_tp2":        rr_tp2,
+            "rr_tp3":        rr_tp3,
             "shares":        sizing["shares"],
             "risk_dollars":  sizing["risk_dollars"],
             "position_val":  sizing["position_val"],
