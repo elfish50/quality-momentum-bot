@@ -131,12 +131,22 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         loop = asyncio.get_event_loop()
         sig  = await loop.run_in_executor(None, lambda: analyze_ticker(ticker))
-        if sig:
+       if sig:
             await update.message.reply_text(format_alert(sig))
         else:
             await update.message.reply_text(
-                f"{ticker} did not pass filters.\n"
-                f"Possible reasons: no BB 3rd touch, R:R too low, quality screen failed, downtrend."
+                f"{ticker} — no signal\n"
+                f"==============================\n"
+                f"Common reasons:\n"
+                f"  • Price below SMA50 (downtrend)\n"
+                f"  • Last BB touch > 5 bars ago\n"
+                f"  • RSI falling or out of range\n"
+                f"  • R:R below 1.5x at TP2\n"
+                f"  • Quality screen failed\n\n"
+                f"Try /check on a stock that is:\n"
+                f"  • Above its 50-day average\n"
+                f"  • Near its lower Bollinger Band\n"
+                f"  • RSI between 30-65 and rising"
             )
     except Exception:
         await update.message.reply_text(f"Error:\n{traceback.format_exc()[-400:]}")
