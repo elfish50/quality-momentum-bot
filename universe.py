@@ -1,72 +1,35 @@
-"""
-UNIVERSE LOADER
-Fetches all active, tradeable US equity tickers from Alpaca's /v2/assets endpoint.
-Covers Nasdaq, NYSE, NYSE Arca, NYSE American — no extra API key needed.
-
-Filters applied:
-  - status == "active"
-  - tradable == True
-  - asset_class == "us_equity"
-  - exchange in (NASDAQ, NYSE, NYSE ARCA, NYSE AMERICAN)
-  - no OTC / pink sheets
-  - symbol is clean (letters only, no dots/slashes = no preferred shares or warrants)
-
-Result is cached to disk for 24h so we don't hammer Alpaca on every run.
-"""
-
-import os
-import json
-import time
-import requests
+import os, json, requests
 from datetime import datetime, timedelta
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 ALPACA_KEY    = os.getenv("ALPACA_KEY", "")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET", "")
-ALPACA_URL    = "https://paper-api.alpaca.markets/v2"   # assets endpoint works on paper too
-
-CACHE_FILE    = Path(".universe_cache.json")
-CACHE_TTL_H   = 24   # hours before refreshing
-
+ALPACA_URL    = "https://paper-api.alpaca.markets/v2"
+CACHE_FILE    = Path("universe_cache.json")
+CACHE_TTL_H   = 24
 VALID_EXCHANGES = {"NASDAQ", "NYSE", "NYSE ARCA", "NYSE AMERICAN"}
 
-MIN_PRICE     = 5.0    # skip penny stocks
-MAX_PRICE     = 5000.0 # skip extreme outliers
+def _is_clean_symbol(sym):
+    return sym.isalpha() and len(sym) <= 5
 
-
-# ── Fetch from Alpaca ─────────────────────────────────────────────────────────
-
-def _fetch_assets() -> list[dict]:
+def _fetch_from_alpaca():
     headers = {
-        "APCA-API-KEY-ID":     ALPACA_KEY,
+        "APCA-API-KEY-ID": ALPACA_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET,
     }
-    params = {
-        "status":      "active",
-        "asset_class": "us_equity",
-    }
-
-    print("[universe] Fetching asset list from Alpaca...")
+    print("[universe] Fetching from Alpaca...")
     r = requests.get(
         f"{ALPACA_URL}/assets",
         headers=headers,
-        params=params,
+        params={"status": "active", "asset_class": "us_equity"},
         timeout=30,
     )
     r.raise_for_status()
     assets = r.json()
-    print(f"[universe] Raw assets returned: {len(assets)}")
-    return assets
-
-
-def _is_clean_symbol(sym: str) -> bool:
-    """Only plain ticker symbols — no dots, slashes, or numbers (warrants/preferreds)."""
-    return sym.isalpha() and len(sym) <= 5
-
-
-# ── Filter ────────────────────────────────────────────────────────────────────
-
-def _filter_assets(assets: list[dict]) -> list[str]:
+    print(f"[universe] Raw assets: {len(assets)}")
     tickers = []
     for a in assets:
         if not a.get("tradable"):
@@ -77,64 +40,40 @@ def _filter_assets(assets: list[dict]) -> list[str]:
         if not _is_clean_symbol(sym):
             continue
         tickers.append(sym)
-
     tickers = sorted(set(tickers))
-    print(f"[universe] After filter: {len(tickers)} tickers")
+    print(f"[universe] Clean tickers: {len(tickers)}")
     return tickers
 
+def build_universe():
+    tickers = _fetch_from_alpaca()
+    return {
+        "NASDAQ": tickers,
+        "NYSE": [],
+        "SP500": tickers,
+        "ALL": tickers,
+    }
 
-# ── Cache ─────────────────────────────────────────────────────────────────────
+def load_universe(force_refresh=False):
+    if not force_refresh and CACHE_FILE.exists():
+        try:
+            data = json.loads(CACHE_FILE.read_text())
+            cached_at = datetime.fromisoformat(data.get("cached_at", "2000-01-01"))
+            if datetime.now() - cached_at < timedelta(hours=CACHE_TTL_H):
+                all_t = data.get("ALL", [])
+                if len(all_t) > 100:
+                    print(f"[universe] Cache hit: {len(all_t)} tickers")
+                    return data
+        except Exception:
+            pass
+    u = build_universe()
+    u["cached_at"] = datetime.now().isoformat()
+    CACHE_FILE.write_text(json.dumps(u, indent=2))
+    return u
 
-def _load_cache() -> list[str] | None:
-    if not CACHE_FILE.exists():
-        return None
-    try:
-        data = json.loads(CACHE_FILE.read_text())
-        cached_at = datetime.fromisoformat(data["cached_at"])
-        if datetime.now() - cached_at < timedelta(hours=CACHE_TTL_H):
-            tickers = data["tickers"]
-            print(f"[universe] Loaded {len(tickers)} tickers from cache (expires in "
-                  f"{CACHE_TTL_H - int((datetime.now()-cached_at).total_seconds()/3600)}h)")
-            return tickers
-        print("[universe] Cache expired, refreshing...")
-    except Exception:
-        pass
-    return None
-
-
-def _save_cache(tickers: list[str]):
-    CACHE_FILE.write_text(json.dumps({
-        "cached_at": datetime.now().isoformat(),
-        "tickers":   tickers,
-    }, indent=2))
-    print(f"[universe] Cached {len(tickers)} tickers to {CACHE_FILE}")
-
-
-# ── Public API ────────────────────────────────────────────────────────────────
-
-def get_universe(force_refresh: bool = False) -> list[str]:
-    """
-    Returns list of clean, tradeable US equity tickers.
-    Uses 24h disk cache to avoid hammering Alpaca.
-    """
-    if not force_refresh:
-        cached = _load_cache()
-        if cached:
-            return cached
-
-    assets  = _fetch_assets()
-    tickers = _filter_assets(assets)
-    _save_cache(tickers)
-    return tickers
-
-
-def get_universe_batched(batch_size: int = 500) -> list[list[str]]:
-    """Returns universe split into batches for parallel processing."""
-    tickers = get_universe()
-    return [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
-
+def get_all_tickers():
+    return load_universe().get("ALL", [])
 
 if __name__ == "__main__":
-    tickers = get_universe(force_refresh=True)
-    print(f"\nTotal tickers ready to scan: {len(tickers)}")
-    print("Sample:", tickers[:20])
+    u = load_universe(force_refresh=True)
+    print(f"Total: {len(u['ALL'])} tickers")
+    print("Sample:", u["ALL"][:20])
