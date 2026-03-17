@@ -209,6 +209,10 @@ def analyze_ticker(ticker):
         shares       = math.floor(risk_dollars / risk) if risk > 0 else 1
         if shares < 1:
             shares = 1
+
+        # Cap position at 100% of account
+        max_shares   = math.floor(ACCOUNT / entry) if entry > 0 else shares
+        shares       = min(shares, max_shares)
         position_val = round(shares * entry, 2)
         pct_account  = round(position_val / ACCOUNT * 100, 1)
 
