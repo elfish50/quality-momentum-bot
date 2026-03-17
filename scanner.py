@@ -97,7 +97,7 @@ def format_summary(alerts, elapsed, universe_size):
         f"{'='*36}\n"
         f"Strategy: VWAP Mean Reversion\n"
         f"Timeframe: 15-min bars\n"
-        f"Min ext:  1.5% from VWAP\n"
+        f"Min ext:  1.0% from VWAP\n"
         f"Exit:     VWAP touch or 1.5x ATR stop\n"
     )
     if longs:
