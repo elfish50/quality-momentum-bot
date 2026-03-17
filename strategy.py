@@ -1,162 +1,246 @@
 """
-scanner.py — VWAP Mean Reversion Scanner
-Scans 3x per day during market hours.
+VWAP MEAN REVERSION + MOMENTUM FILTER
+
+Logic:
+  1. Price moves >1.5% above or below session VWAP
+  2. EMA9 confirms intraday trend direction
+  3. RSI is NOT extreme (not >70 or <30)
+  4. Price starts reverting back toward VWAP
+  5. Exit at VWAP touch OR trail stop 1.5x ATR
+
+Timeframe: 15-minute bars
+Data: Alpaca (price) + Finnhub (name/sector)
+Account: $1,000 | Risk: 10% = $100 per trade
 """
-import gc
-import time
-import asyncio
+
+import os
+import math
 import traceback
-from datetime import datetime
-from universe import get_all_tickers
+import pandas as pd
+import requests
+from datetime import datetime, timedelta
 
-BATCH_SIZE  = 10
-BATCH_DELAY = 1
-MAX_STOCKS  = 500
+ALPACA_KEY    = os.getenv("ALPACA_KEY", "")
+ALPACA_SECRET = os.getenv("ALPACA_SECRET", "")
+FINNHUB_KEY   = os.getenv("FINNHUB_KEY", "")
 
+ALPACA_URL  = "https://data.alpaca.markets/v2"
+FINNHUB_URL = "https://finnhub.io/api/v1"
 
-def run_scan(tickers: list = None) -> tuple:
-    start   = time.time()
-    tickers = tickers or get_all_tickers()
-    tickers = tickers[:MAX_STOCKS]
-    alerts  = []
-
-    print(f"Scanning {len(tickers)} tickers...")
-
-    for i, ticker in enumerate(tickers):
-        try:
-            sig = analyze_ticker(ticker)
-            if sig:
-                alerts.append(sig)
-                print(f"[ALERT] {sig['signal']} {ticker} | Score {sig['signal_score']} | R:R {sig['rr']:.1f}x | ext {sig['vwap_ext_pct']:+.1f}%")
-        except Exception:
-            pass
-        finally:
-            gc.collect()
-
-        if (i + 1) % BATCH_SIZE == 0:
-            print(f"Progress: {i+1}/{len(tickers)} | Alerts: {len(alerts)}")
-            time.sleep(BATCH_DELAY)
-
-    alerts.sort(key=lambda x: x["signal_score"], reverse=True)
-    elapsed = time.time() - start
-    print(f"Scan done: {len(alerts)} alerts in {elapsed:.0f}s")
-    return alerts, elapsed
+ACCOUNT        = 1_000
+RISK_PCT       = 0.10
+VWAP_EXTENSION = 0.015
+MIN_VOLUME     = 1_000_000
 
 
-def format_alert(sig: dict) -> str:
-    direction = sig["signal"]
-    arrow     = "UP" if direction == "LONG" else "DOWN"
-    vol_note  = "Volume confirmed" if sig.get("vol_confirmed") else "Low volume"
-
-    lines = [
-        f"{'='*36}",
-        f"{direction} {sig['ticker']} — {sig['name']}",
-        f"{'='*36}",
-        f"Strategy: VWAP Mean Reversion",
-        f"Signal:   {sig['signal_score']:.0f}/100",
-        f"Hold:     {sig['hold_time']}",
-        f"Sector:   {sig['sector']}",
-        f"",
-        f"--- VWAP Analysis ---",
-        f"Price:    ${sig['price']:.2f}",
-        f"VWAP:     ${sig['vwap']:.2f}",
-        f"Extension:{sig['vwap_ext_pct']:+.2f}% from VWAP",
-        f"EMA9:     ${sig['ema9']:.2f}",
-        f"RSI:      {sig['rsi']:.1f}",
-        f"Volume:   {sig['vol_ratio']:.1f}x avg — {vol_note}",
-        f"",
-        f"--- Trade Setup ---",
-        f"Direction:{direction} ({arrow})",
-        f"Entry:    ${sig['price']:.2f}",
-        f"Stop:     ${sig['stop']:.2f}  ({sig['stop_pct']:+.1f}%)",
-        f"Target:   ${sig['target']:.2f}  ({sig['tp_pct']:+.1f}% — VWAP)",
-        f"R:R:      {sig['rr']:.2f}x",
-        f"",
-        f"--- Position Sizing ($1k, 10% risk) ---",
-        f"Shares:   {sig['shares']}",
-        f"Value:    ${sig['position_val']:,.0f} ({sig['pct_account']:.1f}% of $1k)",
-        f"Max loss: ${sig['risk_dollars']:.0f}",
-        f"{'='*36}",
-    ]
-    return "\n".join(lines)
-
-
-def format_summary(alerts: list, elapsed: float, universe_size: int) -> str:
-    longs  = [a for a in alerts if a["signal"] == "LONG"]
-    shorts = [a for a in alerts if a["signal"] == "SHORT"]
-    ts     = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    msg = (
-        f"VWAP Reversion Scan — {ts}\n"
-        f"{'='*36}\n"
-        f"Scanned:  {universe_size:,} tickers\n"
-        f"Duration: {elapsed:.0f}s\n"
-        f"LONG:     {len(longs)}\n"
-        f"SHORT:    {len(shorts)}\n"
-        f"Total:    {len(alerts)}\n"
-        f"{'='*36}\n"
-        f"Strategy: VWAP Mean Reversion\n"
-        f"Timeframe: 15-min bars\n"
-        f"Min ext:  1.5% from VWAP\n"
-        f"Exit:     VWAP touch or 1.5x ATR stop\n"
-    )
-    if longs:
-        msg += f"\nTop LONG setups:\n"
-        for a in longs[:5]:
-            msg += f"  {a['ticker']} | Score {a['signal_score']:.0f} | ext {a['vwap_ext_pct']:+.1f}% | R:R {a['rr']:.1f}x\n"
-    if shorts:
-        msg += f"\nTop SHORT setups:\n"
-        for a in shorts[:5]:
-            msg += f"  {a['ticker']} | Score {a['signal_score']:.0f} | ext {a['vwap_ext_pct']:+.1f}% | R:R {a['rr']:.1f}x\n"
-    return msg
-
-
-async def run_universe_scan(bot, chat_id: str, tickers: list = None):
-    from universe import load_universe
-
-    if tickers:
-        scan_list     = tickers
-        universe_size = len(tickers)
-    else:
-        u             = load_universe()
-        scan_list     = u.get("ALL", [])[:MAX_STOCKS]
-        universe_size = len(scan_list)
-
-    await bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"VWAP Reversion Scan starting...\n"
-            f"Scanning {universe_size} tickers\n"
-            f"Timeframe: 15-min bars\n"
-            f"Est. time: ~{universe_size // 100 + 1} min"
-        )
-    )
-
+def get_intraday_data(ticker):
+    today = datetime.now().strftime("%Y-%m-%d")
+    headers = {
+        "APCA-API-KEY-ID":     ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+    params = {
+        "start":     f"{today}T09:30:00-04:00",
+        "end":       f"{today}T16:00:00-04:00",
+        "timeframe": "15Min",
+        "limit":     100,
+        "feed":      "iex",
+    }
     try:
-        loop            = asyncio.get_event_loop()
-        alerts, elapsed = await loop.run_in_executor(
-            None, lambda: run_scan(scan_list)
-        )
+        r    = requests.get(f"{ALPACA_URL}/stocks/{ticker}/bars",
+                            headers=headers, params=params, timeout=15)
+        bars = r.json().get("bars")
+        if not bars or len(bars) < 4:
+            return None
+        df = pd.DataFrame([{
+            "Time":   pd.to_datetime(b["t"]),
+            "Open":   float(b["o"]),
+            "High":   float(b["h"]),
+            "Low":    float(b["l"]),
+            "Close":  float(b["c"]),
+            "Volume": float(b["v"]),
+        } for b in bars])
+        return df.sort_values("Time").reset_index(drop=True)
+    except Exception as e:
+        print(f"[{ticker}] Alpaca intraday error: {e}")
+        return None
+
+
+def get_daily_volume(ticker):
+    headers = {
+        "APCA-API-KEY-ID":     ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+    end   = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    params = {
+        "start":     start,
+        "end":       end,
+        "timeframe": "1Day",
+        "limit":     20,
+        "feed":      "iex",
+    }
+    try:
+        r    = requests.get(f"{ALPACA_URL}/stocks/{ticker}/bars",
+                            headers=headers, params=params, timeout=15)
+        bars = r.json().get("bars")
+        if not bars:
+            return 0
+        return sum(float(b["v"]) for b in bars) / len(bars)
     except Exception:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"Scan error:\n{traceback.format_exc()[-500:]}"
-        )
-        return
+        return 0
 
-    summary = format_summary(alerts, elapsed, universe_size)
-    await bot.send_message(chat_id=chat_id, text=summary)
 
-    if not alerts:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="No VWAP reversion setups found.\nMarket may be trending strongly or low volatility today."
-        )
-        return
+def get_fundamentals(ticker):
+    def safe(v, d=0.0):
+        try: return float(v) if v not in (None, "", "N/A", "None") else d
+        except: return d
+    try:
+        r1 = requests.get(f"{FINNHUB_URL}/stock/profile2",
+                          params={"symbol": ticker, "token": FINNHUB_KEY},
+                          timeout=15)
+        p  = r1.json()
+        return {
+            "sector": p.get("finnhubIndustry", "Unknown"),
+            "name":   p.get("name", ticker),
+        }
+    except Exception:
+        return {"sector": "Unknown", "name": ticker}
 
-    for sig in alerts:
-        try:
-            await bot.send_message(chat_id=chat_id, text=format_alert(sig))
-            await asyncio.sleep(0.3)
-        except Exception as e:
-            print(f"Failed to send {sig['ticker']}: {e}")
+
+def compute_vwap(df):
+    df = df.copy()
+    df["TP"]     = (df["High"] + df["Low"] + df["Close"]) / 3
+    df["TPV"]    = df["TP"] * df["Volume"]
+    df["CumTPV"] = df["TPV"].cumsum()
+    df["CumVol"] = df["Volume"].cumsum()
+    df["VWAP"]   = df["CumTPV"] / df["CumVol"]
+    df["EMA9"]   = df["Close"].ewm(span=9, adjust=False).mean()
+    delta        = df["Close"].diff()
+    gain         = delta.clip(lower=0)
+    loss         = (-delta).clip(lower=0)
+    avg_gain     = gain.ewm(com=13, adjust=False).mean()
+    avg_loss     = loss.ewm(com=13, adjust=False).mean()
+    rs           = avg_gain / avg_loss.replace(0, float("nan"))
+    df["RSI"]    = 100 - (100 / (1 + rs))
+    high, low, close = df["High"], df["Low"], df["Close"]
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low  - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    df["ATR"]    = tr.rolling(14).mean()
+    df["VolAvg"] = df["Volume"].rolling(10).mean()
+    return df
+
+
+def analyze_ticker(ticker):
+    try:
+        avg_vol = get_daily_volume(ticker)
+        if avg_vol < MIN_VOLUME:
+            return None
+
+        df = get_intraday_data(ticker)
+        if df is None or len(df) < 4:
+            return None
+
+        df = compute_vwap(df)
+
+        current = df.iloc[-1]
+        prev    = df.iloc[-2]
+
+        vwap  = float(current["VWAP"])
+        price = float(current["Close"])
+        ema9  = float(current["EMA9"])
+        rsi   = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
+        atr   = float(current["ATR"]) if not pd.isna(current["ATR"]) else price * 0.005
+
+        vwap_diff_pct = (price - vwap) / vwap
+
+        if abs(vwap_diff_pct) < VWAP_EXTENSION:
+            return None
+
+        if rsi > 70 or rsi < 30:
+            return None
+
+        prev_price = float(prev["Close"])
+
+        if vwap_diff_pct > 0:
+            direction     = "SHORT"
+            reverting     = price < prev_price
+            entry         = price
+            stop          = round(price + atr * 1.5, 2)
+            target        = round(vwap, 2)
+            tp_pct        = round((entry - target) / entry * 100, 1)
+            stop_pct      = round((stop - entry) / entry * 100, 1)
+        else:
+            direction     = "LONG"
+            reverting     = price > prev_price
+            entry         = price
+            stop          = round(price - atr * 1.5, 2)
+            target        = round(vwap, 2)
+            tp_pct        = round((target - entry) / entry * 100, 1)
+            stop_pct      = round((entry - stop) / entry * 100, 1)
+
+        if not reverting:
+            return None
+
+        vol_ratio     = float(current["Volume"]) / float(current["VolAvg"]) if current["VolAvg"] > 0 else 1.0
+        vol_confirmed = vol_ratio >= 1.1
+
+        risk   = abs(entry - stop)
+        reward = abs(target - entry)
+        rr     = round(reward / risk, 2) if risk > 0 else 0
+
+        if rr < 1.0:
+            return None
+
+        risk_dollars = ACCOUNT * RISK_PCT
+        shares       = math.floor(risk_dollars / risk) if risk > 0 else 1
+        if shares < 1:
+            shares = 1
+        position_val = round(shares * entry, 2)
+        pct_account  = round(position_val / ACCOUNT * 100, 1)
+
+        fund = get_fundamentals(ticker)
+
+        score = 0.0
+        score += 30 if abs(vwap_diff_pct) >= 0.025 else 20
+        score += 25 if 40 <= rsi <= 60 else 15
+        score += 25 if vol_confirmed else 10
+        score += 20 if rr >= 2.0 else 10
+
+        print(f"[{ticker}] {direction} | VWAP reversion | Score {score:.0f} | RSI {rsi:.0f} | R:R {rr:.1f}x | ext {vwap_diff_pct*100:+.1f}%")
+
+        return {
+            "ticker":        ticker,
+            "signal":        direction,
+            "strategy":      "VWAP Reversion",
+            "hold_time":     "INTRADAY (close by 4 PM ET)",
+            "signal_score":  round(score, 1),
+            "price":         round(entry, 2),
+            "vwap":          round(vwap, 2),
+            "ema9":          round(ema9, 2),
+            "rsi":           round(rsi, 1),
+            "atr":           round(atr, 2),
+            "vwap_ext_pct":  round(vwap_diff_pct * 100, 2),
+            "vol_ratio":     round(vol_ratio, 2),
+            "vol_confirmed": vol_confirmed,
+            "direction":     direction,
+            "stop":          stop,
+            "target":        target,
+            "tp_pct":        tp_pct,
+            "stop_pct":      stop_pct,
+            "rr":            rr,
+            "shares":        shares,
+            "risk_dollars":  round(risk_dollars, 2),
+            "position_val":  position_val,
+            "pct_account":   pct_account,
+            "sector":        fund.get("sector", ""),
+            "name":          fund.get("name", ticker),
+            "avg_volume":    round(avg_vol),
+        }
+
+    except Exception:
+        print(f"[{ticker}] ERROR: {traceback.format_exc()[-300:]}")
+        return None
