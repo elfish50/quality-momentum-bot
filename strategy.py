@@ -8,7 +8,6 @@ import asyncio
 import traceback
 from datetime import datetime
 from universe import get_all_tickers
-from strategy import analyze_ticker
 
 BATCH_SIZE  = 10
 BATCH_DELAY = 1
