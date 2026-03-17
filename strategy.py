@@ -8,7 +8,7 @@ Logic:
   4. Price starts reverting back toward VWAP
   5. Exit at VWAP touch OR trail stop 1.5x ATR
 
-Timeframe: 15-minute bars
+Timeframe: 15-minute bars (regular market hours only)
 Data: Alpaca (price) + Finnhub (name/sector)
 Account: $1,000 | Risk: 10% = $100 per trade
 """
@@ -33,15 +33,23 @@ VWAP_EXTENSION = 0.015
 MIN_VOLUME     = 1_000_000
 
 
+def is_market_open():
+    """Returns True only during regular market hours 9:30 AM - 4 PM ET."""
+    now_utc  = datetime.utcnow()
+    now_hour = now_utc.hour + now_utc.minute / 60
+    # 13:30 UTC = 9:30 AM ET | 20:00 UTC = 4:00 PM ET
+    return 13.5 <= now_hour <= 20.0
+
+
 def get_intraday_data(ticker):
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.utcnow().strftime("%Y-%m-%d")
     headers = {
         "APCA-API-KEY-ID":     ALPACA_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET,
     }
     params = {
-        "start":     f"{today}T09:30:00-04:00",
-        "end":       f"{today}T16:00:00-04:00",
+        "start":     f"{today}T13:30:00Z",
+        "end":       f"{today}T20:00:00Z",
         "timeframe": "15Min",
         "limit":     100,
         "feed":      "iex",
@@ -71,8 +79,8 @@ def get_daily_volume(ticker):
         "APCA-API-KEY-ID":     ALPACA_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET,
     }
-    end   = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    end   = datetime.utcnow().strftime("%Y-%m-%d")
+    start = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
     params = {
         "start":     start,
         "end":       end,
@@ -92,14 +100,13 @@ def get_daily_volume(ticker):
 
 
 def get_fundamentals(ticker):
-    def safe(v, d=0.0):
-        try: return float(v) if v not in (None, "", "N/A", "None") else d
-        except: return d
     try:
-        r1 = requests.get(f"{FINNHUB_URL}/stock/profile2",
-                          params={"symbol": ticker, "token": FINNHUB_KEY},
-                          timeout=15)
-        p  = r1.json()
+        r = requests.get(
+            f"{FINNHUB_URL}/stock/profile2",
+            params={"symbol": ticker, "token": FINNHUB_KEY},
+            timeout=15
+        )
+        p = r.json()
         return {
             "sector": p.get("finnhubIndustry", "Unknown"),
             "name":   p.get("name", ticker),
@@ -123,7 +130,9 @@ def compute_vwap(df):
     avg_loss     = loss.ewm(com=13, adjust=False).mean()
     rs           = avg_gain / avg_loss.replace(0, float("nan"))
     df["RSI"]    = 100 - (100 / (1 + rs))
-    high, low, close = df["High"], df["Low"], df["Close"]
+    high         = df["High"]
+    low          = df["Low"]
+    close        = df["Close"]
     tr = pd.concat([
         high - low,
         (high - close.shift(1)).abs(),
@@ -136,6 +145,9 @@ def compute_vwap(df):
 
 def analyze_ticker(ticker):
     try:
+        if not is_market_open():
+            return None
+
         avg_vol = get_daily_volume(ticker)
         if avg_vol < MIN_VOLUME:
             return None
