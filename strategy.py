@@ -2,7 +2,7 @@
 VWAP MEAN REVERSION + MOMENTUM FILTER
 
 Logic:
-  1. Price moves >1.5% above or below session VWAP
+  1. Price moves >1.0% above or below session VWAP
   2. EMA9 confirms intraday trend direction
   3. RSI is NOT extreme (not >70 or <30)
   4. Price starts reverting back toward VWAP
@@ -29,15 +29,13 @@ FINNHUB_URL = "https://finnhub.io/api/v1"
 
 ACCOUNT        = 1_000
 RISK_PCT       = 0.10
-VWAP_EXTENSION = 0.015
-MIN_VOLUME     = 1_000_000
+VWAP_EXTENSION = 0.010
+MIN_VOLUME     = 200_000
 
 
 def is_market_open():
-    """Returns True only during regular market hours 9:30 AM - 4 PM ET."""
     now_utc  = datetime.utcnow()
     now_hour = now_utc.hour + now_utc.minute / 60
-    # 13:30 UTC = 9:30 AM ET | 20:00 UTC = 4:00 PM ET
     return 13.5 <= now_hour <= 20.0
 
 
@@ -178,21 +176,21 @@ def analyze_ticker(ticker):
         prev_price = float(prev["Close"])
 
         if vwap_diff_pct > 0:
-            direction     = "SHORT"
-            reverting     = price < prev_price
-            entry         = price
-            stop          = round(price + atr * 1.5, 2)
-            target        = round(vwap, 2)
-            tp_pct        = round((entry - target) / entry * 100, 1)
-            stop_pct      = round((stop - entry) / entry * 100, 1)
+            direction = "SHORT"
+            reverting = price < prev_price
+            entry     = price
+            stop      = round(price + atr * 1.5, 2)
+            target    = round(vwap, 2)
+            tp_pct    = round((entry - target) / entry * 100, 1)
+            stop_pct  = round((stop - entry) / entry * 100, 1)
         else:
-            direction     = "LONG"
-            reverting     = price > prev_price
-            entry         = price
-            stop          = round(price - atr * 1.5, 2)
-            target        = round(vwap, 2)
-            tp_pct        = round((target - entry) / entry * 100, 1)
-            stop_pct      = round((entry - stop) / entry * 100, 1)
+            direction = "LONG"
+            reverting = price > prev_price
+            entry     = price
+            stop      = round(price - atr * 1.5, 2)
+            target    = round(vwap, 2)
+            tp_pct    = round((target - entry) / entry * 100, 1)
+            stop_pct  = round((entry - stop) / entry * 100, 1)
 
         if not reverting:
             return None
