@@ -125,15 +125,35 @@ def format_alert(sig):
 
 def format_summary(alerts, elapsed, universe_size):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    w2 = [a for a in alerts if a["setup"] == "Wave 2 Pullback"]
-    w4 = [a for a in alerts if a["setup"] == "Wave 4 Pullback"]
-    ab = [a for a in alerts if a["setup"] == "ABC Correction"]
+    w2   = [a for a in alerts if a["setup"] == "Wave 2 Pullback"]
+    w4   = [a for a in alerts if a["setup"] == "Wave 4 Pullback"]
+    ab   = [a for a in alerts if a["setup"] == "ABC Correction"]
+    buys = [a for a in alerts if a["signal"] == "BUY"]
+    watch = [a for a in alerts if a["signal"] == "WATCH"]
 
     msg = (
         f"Elliott Wave + Fib Scan -- {ts}\n"
         f"{'='*36}\n"
         f"Scanned:       {universe_size:,} tickers\n"
         f"Duration:      {elapsed:.0f}s\n"
+        f"BUY signals:   {len(buys)}  (volume confirmed)\n"
+        f"WATCH signals: {len(watch)}  (waiting for volume)\n"
+        f"Wave 2 setups: {len(w2)}\n"
+        f"Wave 4 setups: {len(w4)}\n"
+        f"ABC setups:    {len(ab)}\n"
+        f"Total:         {len(alerts)}\n"w2   = [a for a in alerts if a["setup"] == "Wave 2 Pullback"]
+    w4   = [a for a in alerts if a["setup"] == "Wave 4 Pullback"]
+    ab   = [a for a in alerts if a["setup"] == "ABC Correction"]
+    buys = [a for a in alerts if a["signal"] == "BUY"]
+    watch = [a for a in alerts if a["signal"] == "WATCH"]
+
+    msg = (
+        f"Elliott Wave + Fib Scan -- {ts}\n"
+        f"{'='*36}\n"
+        f"Scanned:       {universe_size:,} tickers\n"
+        f"Duration:      {elapsed:.0f}s\n"
+        f"BUY signals:   {len(buys)}  (volume confirmed)\n"
+        f"WATCH signals: {len(watch)}  (waiting for volume)\n"
         f"Wave 2 setups: {len(w2)}\n"
         f"Wave 4 setups: {len(w4)}\n"
         f"ABC setups:    {len(ab)}\n"
