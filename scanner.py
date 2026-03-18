@@ -51,7 +51,7 @@ def format_alert(sig):
 
     lines = [
         f"{'='*38}",
-        f"LONG {sig['ticker']} -- {sig['name']}",
+        f"{sig['signal']} {sig['ticker']} -- {sig['name']}",
         f"{'='*38}",
         f"Setup:    {sig['setup']}",
         f"Signal:   {sig['signal_score']:.0f}/100 | Quality: {sig['quality_score']:.0f}/100",
