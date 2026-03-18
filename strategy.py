@@ -590,17 +590,21 @@ def analyze_ticker(ticker):
         elif rr >= 2.0: score += 12
         else:           score += 5
 
-        # 6. Hold time
+# 6. Signal type: BUY (volume confirmed) vs WATCH (waiting for volume)
+        vol_confirmed = setup.get("vol_confirmed", False)
+        signal_type   = "BUY" if vol_confirmed else "WATCH"
+
+        # 7. Hold time
         if score >= 70:
             hold_time = "POSITION (3-8 weeks)"
         else:
             hold_time = "SWING (1-3 weeks)"
 
-        print(f"[{ticker}] BUY | {setup['setup']} | Score {score:.0f} | RSI {rsi:.0f} | R:R TP2 {setup.get('rr_tp2',0):.1f}x")
+        print(f"[{ticker}] {signal_type} | {setup['setup']} | Score {score:.0f} | RSI {rsi:.0f} | R:R TP2 {setup.get('rr_tp2',0):.1f}x | Vol {setup.get('vol_ratio',0):.1f}x")
 
         return {
             "ticker":        ticker,
-            "signal":        "LONG",
+            "signal":        signal_type,
             "setup":         setup["setup"],
             "hold_time":     hold_time,
             "signal_score":  round(score, 1),
