@@ -2,6 +2,7 @@
 scanner.py - Elliott Wave + Fibonacci Scanner
 Berkshire Quality Screen + Wave 2 / Wave 4 / ABC setups
 LONG ONLY | Daily bars
+BUY = volume confirmed | WATCH = waiting for volume
 """
 import gc
 import time
@@ -29,7 +30,7 @@ def run_scan(tickers=None):
             sig = analyze_ticker(ticker)
             if sig:
                 alerts.append(sig)
-                print(f"[ALERT] {ticker} | {sig['setup']} | Score {sig['signal_score']} | R:R TP2 {sig['rr_tp2']:.1f}x")
+                print(f"[{sig['signal']}] {ticker} | {sig['setup']} | Score {sig['signal_score']} | R:R TP2 {sig['rr_tp2']:.1f}x | Vol {sig['vol_ratio']:.1f}x")
         except Exception:
             pass
         finally:
@@ -46,17 +47,24 @@ def run_scan(tickers=None):
 
 
 def format_alert(sig):
-    vol_note = "Volume confirmed" if sig.get("vol_confirmed") else "Low volume"
+    vol_note = "Volume confirmed" if sig.get("vol_confirmed") else "Low volume -- WATCH only"
     d        = sig.get("setup_detail", {})
+    label    = sig["signal"]
 
     lines = [
         f"{'='*38}",
-        f"{sig['signal']} {sig['ticker']} -- {sig['name']}",
+        f"{label} {sig['ticker']} -- {sig['name']}",
         f"{'='*38}",
         f"Setup:    {sig['setup']}",
         f"Signal:   {sig['signal_score']:.0f}/100 | Quality: {sig['quality_score']:.0f}/100",
         f"Hold:     {sig['hold_time']}",
         f"Sector:   {sig['sector']}",
+    ]
+
+    if label == "WATCH":
+        lines.append(f"** Volume low ({sig['vol_ratio']:.1f}x) -- wait for volume before entering **")
+
+    lines += [
         f"",
         f"--- Elliott Wave Analysis ---",
     ]
@@ -124,27 +132,11 @@ def format_alert(sig):
 
 
 def format_summary(alerts, elapsed, universe_size):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    w2   = [a for a in alerts if a["setup"] == "Wave 2 Pullback"]
-    w4   = [a for a in alerts if a["setup"] == "Wave 4 Pullback"]
-    ab   = [a for a in alerts if a["setup"] == "ABC Correction"]
-    buys = [a for a in alerts if a["signal"] == "BUY"]
-    watch = [a for a in alerts if a["signal"] == "WATCH"]
-
-    msg = (
-        f"Elliott Wave + Fib Scan -- {ts}\n"
-        f"{'='*36}\n"
-        f"Scanned:       {universe_size:,} tickers\n"
-        f"Duration:      {elapsed:.0f}s\n"
-        f"BUY signals:   {len(buys)}  (volume confirmed)\n"
-        f"WATCH signals: {len(watch)}  (waiting for volume)\n"
-        f"Wave 2 setups: {len(w2)}\n"
-        f"Wave 4 setups: {len(w4)}\n"
-        f"ABC setups:    {len(ab)}\n"
-        f"Total:         {len(alerts)}\n"w2   = [a for a in alerts if a["setup"] == "Wave 2 Pullback"]
-    w4   = [a for a in alerts if a["setup"] == "Wave 4 Pullback"]
-    ab   = [a for a in alerts if a["setup"] == "ABC Correction"]
-    buys = [a for a in alerts if a["signal"] == "BUY"]
+    ts    = datetime.now().strftime("%Y-%m-%d %H:%M")
+    w2    = [a for a in alerts if a["setup"] == "Wave 2 Pullback"]
+    w4    = [a for a in alerts if a["setup"] == "Wave 4 Pullback"]
+    ab    = [a for a in alerts if a["setup"] == "ABC Correction"]
+    buys  = [a for a in alerts if a["signal"] == "BUY"]
     watch = [a for a in alerts if a["signal"] == "WATCH"]
 
     msg = (
@@ -165,10 +157,16 @@ def format_summary(alerts, elapsed, universe_size):
         f"Quality: Berkshire screen\n"
     )
 
-    if alerts:
-        msg += f"\nTop setups:\n"
-        for a in alerts[:5]:
-            msg += f"  {a['ticker']} | {a['setup']} | Score {a['signal_score']:.0f} | R:R TP2 {a['rr_tp2']:.1f}x | +{a['tp2_pct']:.1f}%\n"
+    if buys:
+        msg += f"\nTop BUY signals (volume confirmed):\n"
+        for a in buys[:5]:
+            msg += f"  {a['ticker']} | {a['setup']} | Score {a['signal_score']:.0f} | R:R {a['rr_tp2']:.1f}x | +{a['tp2_pct']:.1f}%\n"
+
+    if watch:
+        msg += f"\nTop WATCH signals (wait for volume):\n"
+        for a in watch[:5]:
+            msg += f"  {a['ticker']} | {a['setup']} | Score {a['signal_score']:.0f} | Vol {a['vol_ratio']:.1f}x | +{a['tp2_pct']:.1f}%\n"
+
     return msg
 
 
@@ -214,7 +212,6 @@ async def run_universe_scan(bot, chat_id, tickers=None):
             chat_id=chat_id,
             text=(
                 "No Elliott Wave setups found today.\n"
-                "Market may not have clean wave structures right now.\n"
                 "Try again tomorrow or use /check TICKER for specific stocks."
             )
         )
