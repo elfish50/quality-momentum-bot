@@ -221,5 +221,11 @@ async def run_universe_scan(bot, chat_id, tickers=None):
         try:
             await bot.send_message(chat_id=chat_id, text=format_alert(sig))
             await asyncio.sleep(0.3)
-        except Exception as e:
-            print(f"Failed to send {sig['ticker']}: {e}")
+
+            # Auto-execute BUY signals on paper account
+            if sig["signal"] == "BUY":
+                from trader import execute_signal, format_execution_result
+                import asyncio as _asyncio
+                loop   = _asyncio.get_event_loop()
+                result = await loop.run_in_executor(None, lambda: execute_signal(sig))
+                await bot.send_message(chat_id=chat_id, text=format_execution_result(result, sig))
