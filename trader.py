@@ -101,51 +101,8 @@ def cancel_order(order_id):
 
 # ── Execute signal ────────────────────────────────────────────────────────────
 
-def execute_signal(sig: dict) -> dict:
-    """
-    Places 3 orders for a BUY signal:
-      1. Market buy
-      2. Stop loss
-      3. Take profit (TP2)
-
-    Returns result dict with order IDs and status.
-    """
-    ticker = sig["ticker"]
-    shares = sig["shares"]
-    stop   = sig["stop"]
-    tp2    = sig["tp2"]
-
-    result = {
-        "ticker":     ticker,
-        "shares":     shares,
-        "entry":      sig["price"],
-        "stop":       stop,
-        "tp2":        tp2,
-        "orders":     [],
-        "success":    False,
-        "error":      None,
-    }
-
-    # Check if already in position
-    existing = get_position(ticker)
-    if existing and float(existing.get("qty", 0)) > 0:
-        result["error"] = f"Already have position in {ticker}"
-        return result
-
-    # Check buying power
-    bp = get_buying_power()
-    cost = shares * sig["price"]
-    if cost > bp:
-        # Reduce shares to fit buying power
-        shares = int(bp * 0.95 / sig["price"])
-        if shares < 1:
-            result["error"] = f"Insufficient buying power (${bp:,.0f})"
-            return result
-        result["shares"] = shares
-
-    try:
-        # 1. Market buy order
-        buy_order = requests.post(
+# Place bracket order: buy + stop loss + take profit in one
+        bracket_order = requests.post(
             f"{PAPER_URL}/orders",
             headers=HEADERS,
             json={
@@ -154,96 +111,19 @@ def execute_signal(sig: dict) -> dict:
                 "side":          "buy",
                 "type":          "market",
                 "time_in_force": "day",
+                "order_class":   "bracket",
+                "stop_loss":     {"stop_price": str(round(stop, 2))},
+                "take_profit":   {"limit_price": str(round(tp2, 2))},
             },
             timeout=15
         ).json()
 
-        if "id" not in buy_order:
-            result["error"] = f"Buy order failed: {buy_order.get('message', 'unknown error')}"
+        if "id" not in bracket_order:
+            result["error"] = f"Bracket order failed: {bracket_order.get('message', 'unknown error')}"
             return result
 
-        result["orders"].append({
-            "type": "BUY",
-            "id":   buy_order["id"],
-            "qty":  shares,
-        })
-
-        # 2. Stop loss order
-        stop_order = requests.post(
-            f"{PAPER_URL}/orders",
-            headers=HEADERS,
-            json={
-                "symbol":        ticker,
-                "qty":           str(shares),
-                "side":          "sell",
-                "type":          "stop",
-                "stop_price":    str(round(stop, 2)),
-                "time_in_force": "gtc",
-            },
-            timeout=15
-        ).json()
-
-        if "id" in stop_order:
-            result["orders"].append({
-                "type":  "STOP",
-                "id":    stop_order["id"],
-                "price": stop,
-            })
-
-        # 3. Take profit order (limit at TP2)
-        tp_order = requests.post(
-            f"{PAPER_URL}/orders",
-            headers=HEADERS,
-            json={
-                "symbol":        ticker,
-                "qty":           str(shares),
-                "side":          "sell",
-                "type":          "limit",
-                "limit_price":   str(round(tp2, 2)),
-                "time_in_force": "gtc",
-            },
-            timeout=15
-        ).json()
-
-        if "id" in tp_order:
-            result["orders"].append({
-                "type":  "TAKE_PROFIT",
-                "id":    tp_order["id"],
-                "price": tp2,
-            })
-
+        result["orders"].append({"type": "BRACKET", "id": bracket_order["id"]})
         result["success"] = True
-
-    except Exception as e:
-        result["error"] = str(e)
-
-    return result
-
-
-def format_execution_result(result: dict, sig: dict) -> str:
-    if not result["success"]:
-        return (
-            f"Trade FAILED for {result['ticker']}\n"
-            f"Reason: {result['error']}"
-        )
-
-    lines = [
-        f"{'='*36}",
-        f"PAPER TRADE PLACED",
-        f"{'='*36}",
-        f"Ticker:  {result['ticker']}",
-        f"Setup:   {sig.get('setup', '')}",
-        f"",
-        f"BUY  {result['shares']} shares @ ~${result['entry']:.2f}",
-        f"STOP  @ ${result['stop']:.2f}  ({((result['stop']-result['entry'])/result['entry']*100):+.1f}%)",
-        f"TP2   @ ${result['tp2']:.2f}  (+{sig.get('tp2_pct',0):.1f}%)",
-        f"",
-        f"Max loss:  ${sig.get('risk_dollars', 100):.0f}",
-        f"R:R TP2:   {sig.get('rr_tp2', 0):.2f}x",
-        f"Orders:    {len(result['orders'])} placed",
-        f"{'='*36}",
-    ]
-    return "\n".join(lines)
 
 
 # ── Portfolio summary ─────────────────────────────────────────────────────────
