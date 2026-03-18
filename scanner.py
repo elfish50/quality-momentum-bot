@@ -10,6 +10,7 @@ import asyncio
 import traceback
 from datetime import datetime
 from universe import get_all_tickers
+from screener import get_priority_tickers
 from strategy import analyze_ticker
 
 BATCH_SIZE  = 10
@@ -19,7 +20,12 @@ MAX_STOCKS  = 500
 
 def run_scan(tickers=None):
     start   = time.time()
-    tickers = tickers or get_all_tickers()
+    if not tickers:
+        u = get_all_tickers()
+        priority = get_priority_tickers(universe=u)
+        rest = [t for t in u if t not in set(priority)]
+        import random; random.shuffle(rest)
+        tickers = priority + rest
     tickers = tickers[:MAX_STOCKS]
     alerts  = []
 
