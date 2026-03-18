@@ -35,9 +35,12 @@ HEADERS = {
 def get_account():
     try:
         r = requests.get(f"{PAPER_URL}/account", headers=HEADERS, timeout=15)
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
+        data = r.json()
+        if isinstance(data, dict):
+            return data
+        return {}
+    except Exception:
+        return {}
 
 
 def get_buying_power():
@@ -48,7 +51,10 @@ def get_buying_power():
 def get_positions():
     try:
         r = requests.get(f"{PAPER_URL}/positions", headers=HEADERS, timeout=15)
-        return r.json()
+        data = r.json()
+        if isinstance(data, list):
+            return [p for p in data if isinstance(p, dict)]
+        return []
     except Exception:
         return []
 
@@ -58,7 +64,8 @@ def get_position(ticker):
         r = requests.get(f"{PAPER_URL}/positions/{ticker}", headers=HEADERS, timeout=15)
         if r.status_code == 404:
             return None
-        return r.json()
+        data = r.json()
+        return data if isinstance(data, dict) else None
     except Exception:
         return None
 
@@ -71,7 +78,10 @@ def get_orders(status="open"):
             params={"status": status, "limit": 50},
             timeout=15
         )
-        return r.json()
+        data = r.json()
+        if isinstance(data, list):
+            return [o for o in data if isinstance(o, dict)]
+        return []
     except Exception:
         return []
 
@@ -90,8 +100,6 @@ def execute_signal(sig: dict) -> dict:
       - Market buy
       - Stop loss at invalidation level
       - Take profit limit at TP2
-
-    Bracket orders keep stop + TP linked to the position automatically.
     """
     ticker = sig["ticker"]
     shares = sig["shares"]
@@ -126,7 +134,6 @@ def execute_signal(sig: dict) -> dict:
         result["shares"] = shares
 
     try:
-        # Bracket order: entry + stop loss + take profit in one request
         order = requests.post(
             f"{PAPER_URL}/orders",
             headers=HEADERS,
@@ -143,17 +150,14 @@ def execute_signal(sig: dict) -> dict:
             timeout=15
         ).json()
 
-        if "id" not in order:
-            result["error"] = f"Order failed: {order.get('message', 'unknown error')}"
+        if not isinstance(order, dict) or "id" not in order:
+            result["error"] = f"Order failed: {order.get('message', str(order)[:200]) if isinstance(order, dict) else str(order)[:200]}"
             return result
 
-        result["orders"].append({
-            "type": "BRACKET",
-            "id":   order["id"],
-        })
+        result["orders"].append({"type": "BRACKET", "id": order["id"]})
         result["success"] = True
 
-    except Exception as e:
+    except Exception:
         result["error"] = traceback.format_exc()[-300:]
 
     return result
@@ -192,11 +196,11 @@ def format_portfolio() -> str:
     acc       = get_account()
     positions = get_positions()
 
-    equity   = float(acc.get("equity", 0))
-    cash     = float(acc.get("cash", 0))
-    last_eq  = float(acc.get("last_equity", equity))
-    pl_day   = equity - last_eq
-    pl_pct   = pl_day / last_eq * 100 if last_eq > 0 else 0
+    equity  = float(acc.get("equity", 0))
+    cash    = float(acc.get("cash", 0))
+    last_eq = float(acc.get("last_equity", equity) or equity)
+    pl_day  = equity - last_eq
+    pl_pct  = pl_day / last_eq * 100 if last_eq > 0 else 0
 
     lines = [
         f"{'='*36}",
@@ -214,12 +218,14 @@ def format_portfolio() -> str:
     else:
         lines.append("")
         for p in positions:
+            if not isinstance(p, dict):
+                continue
             sym       = p.get("symbol", "")
             qty       = float(p.get("qty", 0))
-            avg_cost  = float(p.get("avg_entry_price", 0))
-            cur_price = float(p.get("current_price", 0))
-            pl_pos    = float(p.get("unrealized_pl", 0))
-            pl_pct_p  = float(p.get("unrealized_plpc", 0)) * 100
+            avg_cost  = float(p.get("avg_entry_price", 0) or 0)
+            cur_price = float(p.get("current_price", 0) or 0)
+            pl_pos    = float(p.get("unrealized_pl", 0) or 0)
+            pl_pct_p  = float(p.get("unrealized_plpc", 0) or 0) * 100
             lines.append(
                 f"{sym:<6} {qty:.0f} sh | "
                 f"Avg ${avg_cost:.2f} | "
@@ -232,7 +238,7 @@ def format_portfolio() -> str:
 
 def format_trade_history() -> str:
     orders = get_orders(status="closed")
-    filled = [o for o in orders if o.get("status") == "filled"]
+    filled = [o for o in orders if isinstance(o, dict) and o.get("status") == "filled"]
 
     if not filled:
         return "No completed trades yet."
@@ -244,11 +250,11 @@ def format_trade_history() -> str:
     ]
 
     for o in filled[:20]:
-        sym      = o.get("symbol", "")
-        side     = o.get("side", "").upper()
-        qty      = o.get("filled_qty", "?")
-        price    = float(o.get("filled_avg_price", 0) or 0)
-        date     = o.get("filled_at", "")[:10] if o.get("filled_at") else ""
+        sym   = o.get("symbol", "")
+        side  = o.get("side", "").upper()
+        qty   = o.get("filled_qty", "?")
+        price = float(o.get("filled_avg_price", 0) or 0)
+        date  = o.get("filled_at", "")[:10] if o.get("filled_at") else ""
         lines.append(f"{date} {side:<5} {sym:<6} {qty} sh @ ${price:.2f}")
 
     return "\n".join(lines)
