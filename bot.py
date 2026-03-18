@@ -1,5 +1,6 @@
 """
-Quality Momentum Bot - VWAP Mean Reversion
+Quality Momentum Bot - Elliott Wave + Fibonacci
+Auto-executes BUY signals on Alpaca paper account
 """
 import asyncio
 import json
@@ -36,15 +37,18 @@ async def handle_health(request):
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Quality Momentum Bot\n"
-        "VWAP Mean Reversion Strategy\n"
+        "Elliott Wave + Fibonacci Strategy\n"
         "==============================\n"
-        "/scan - Full scan\n"
+        "/scan - Full universe scan\n"
         "/scan AAPL MSFT - Scan specific tickers\n"
         "/check AAPL - Analyze one stock\n"
         "/watch AAPL - Add to watchlist\n"
         "/unwatch AAPL - Remove from watchlist\n"
         "/list - Show watchlist\n"
         "/scan_watchlist - Scan watchlist\n"
+        "/portfolio - Paper account P&L\n"
+        "/trades - Recent trade history\n"
+        "/cancel - Cancel all open orders\n"
         "/strategy - How it works\n"
         "/settings - Bot settings\n"
         "Auto-scans: Mon-Fri 10AM, 12PM, 2PM ET"
@@ -53,15 +57,25 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_strategy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "VWAP Mean Reversion + Momentum Filter\n"
+        "Elliott Wave + Fibonacci Strategy\n"
         "==============================\n"
-        "1. Volume filter: min 1M shares/day\n"
-        "2. Price moves >1.5% above/below VWAP\n"
-        "3. RSI not extreme (30-70)\n"
-        "4. Price starts reverting toward VWAP\n"
-        "5. Exit at VWAP touch or 1.5x ATR stop\n"
-        "Timeframe: 15-min bars\n"
-        "Account: $1,000 | Risk: $100/trade"
+        "SETUPS (LONG ONLY):\n"
+        "  Wave 2: 50-61.8% Fib retracement\n"
+        "  Wave 4: 38.2% Fib retracement\n"
+        "  ABC: End of corrective wave\n\n"
+        "STOPS (invalidation rules):\n"
+        "  Wave 2: below Wave 1 origin\n"
+        "  Wave 4: below Wave 1 high\n"
+        "  ABC: below Wave A low\n\n"
+        "TARGETS:\n"
+        "  TP1: 1.272x Fib extension\n"
+        "  TP2: 1.618x Fib extension\n"
+        "  TP3: 2.618x stretch target\n\n"
+        "SIGNALS:\n"
+        "  BUY = volume confirmed (auto-executed)\n"
+        "  WATCH = wait for volume before entering\n\n"
+        "Quality: Berkshire screen (ROE/margins/EPS)\n"
+        "Account: $100k paper | Risk: $100/trade"
     )
 
 
@@ -73,7 +87,7 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Scanning: {', '.join(tickers)}...")
         asyncio.create_task(run_universe_scan(ctx.bot, chat_id, tickers=tickers))
     else:
-        await update.message.reply_text("Starting VWAP scan...")
+        await update.message.reply_text("Starting Elliott Wave scan...")
         asyncio.create_task(run_universe_scan(ctx.bot, chat_id))
 
 
@@ -87,16 +101,57 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Analyzing {ticker}...")
     try:
         loop = asyncio.get_event_loop()
-        sig = await loop.run_in_executor(None, lambda: analyze_ticker(ticker))
+        sig  = await loop.run_in_executor(None, lambda: analyze_ticker(ticker))
         if sig:
             await update.message.reply_text(format_alert(sig))
+            if sig["signal"] == "BUY":
+                await update.message.reply_text(
+                    "Volume confirmed - auto-executing paper trade..."
+                )
+                from trader import execute_signal, format_execution_result
+                result = await loop.run_in_executor(None, lambda: execute_signal(sig))
+                await update.message.reply_text(format_execution_result(result, sig))
         else:
             await update.message.reply_text(
                 f"{ticker} - no signal\n"
-                "Reasons: not extended from VWAP, RSI extreme,\n"
-                "price not reverting, low volume, market closed.\n"
-                "Only works during market hours 9:30AM-4PM ET"
+                "Reasons: no Elliott Wave setup, quality screen failed,\n"
+                "RSI not confirming, or R:R too low."
             )
+    except Exception:
+        await update.message.reply_text(f"Error:\n{traceback.format_exc()[-400:]}")
+
+
+async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    from trader import format_portfolio
+    await update.message.reply_text("Checking portfolio...")
+    try:
+        loop = asyncio.get_event_loop()
+        msg  = await loop.run_in_executor(None, format_portfolio)
+        await update.message.reply_text(msg)
+    except Exception:
+        await update.message.reply_text(f"Error:\n{traceback.format_exc()[-400:]}")
+
+
+async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    from trader import format_trade_history
+    await update.message.reply_text("Fetching trade history...")
+    try:
+        loop = asyncio.get_event_loop()
+        msg  = await loop.run_in_executor(None, format_trade_history)
+        await update.message.reply_text(msg)
+    except Exception:
+        await update.message.reply_text(f"Error:\n{traceback.format_exc()[-400:]}")
+
+
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    from trader import cancel_all_orders
+    try:
+        loop    = asyncio.get_event_loop()
+        success = await loop.run_in_executor(None, cancel_all_orders)
+        if success:
+            await update.message.reply_text("All open orders cancelled.")
+        else:
+            await update.message.reply_text("No open orders to cancel.")
     except Exception:
         await update.message.reply_text(f"Error:\n{traceback.format_exc()[-400:]}")
 
@@ -170,7 +225,7 @@ async def cmd_universe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     from universe import load_universe
     await update.message.reply_text("Checking universe...")
     try:
-        u = load_universe()
+        u     = load_universe()
         all_t = u.get("ALL", [])
         await update.message.reply_text(
             f"Universe: {len(all_t):,} tickers from Alpaca"
@@ -183,13 +238,14 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Bot Settings\n"
         "==============================\n"
-        "Strategy:  VWAP Mean Reversion\n"
-        "Timeframe: 15-min bars\n"
+        "Strategy:  Elliott Wave + Fibonacci\n"
+        "Direction: LONG ONLY\n"
+        "Timeframe: Daily bars\n"
         "Data:      Alpaca + Finnhub\n"
-        "Account:   $1,000\n"
-        "Risk:      10% = $100/trade\n"
-        "Stop:      1.5x ATR\n"
-        "Min R:R:   1.0x\n"
+        "Account:   $100k paper\n"
+        "Risk:      $100/trade\n"
+        "BUY:       volume confirmed (auto-executed)\n"
+        "WATCH:     volume pending (alert only)\n"
         "Schedule:  Mon-Fri 10AM, 12PM, 2PM ET"
     )
 
@@ -204,17 +260,20 @@ def main():
     )
     bot_app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
 
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(CommandHandler("help", start))
-    bot_app.add_handler(CommandHandler("scan", cmd_scan))
-    bot_app.add_handler(CommandHandler("check", cmd_check))
+    bot_app.add_handler(CommandHandler("start",          start))
+    bot_app.add_handler(CommandHandler("help",           start))
+    bot_app.add_handler(CommandHandler("scan",           cmd_scan))
+    bot_app.add_handler(CommandHandler("check",          cmd_check))
     bot_app.add_handler(CommandHandler("scan_watchlist", cmd_scan_watchlist))
-    bot_app.add_handler(CommandHandler("watch", watch))
-    bot_app.add_handler(CommandHandler("unwatch", unwatch))
-    bot_app.add_handler(CommandHandler("list", list_cmd))
-    bot_app.add_handler(CommandHandler("strategy", cmd_strategy))
-    bot_app.add_handler(CommandHandler("universe", cmd_universe))
-    bot_app.add_handler(CommandHandler("settings", cmd_settings))
+    bot_app.add_handler(CommandHandler("watch",          watch))
+    bot_app.add_handler(CommandHandler("unwatch",        unwatch))
+    bot_app.add_handler(CommandHandler("list",           list_cmd))
+    bot_app.add_handler(CommandHandler("strategy",       cmd_strategy))
+    bot_app.add_handler(CommandHandler("universe",       cmd_universe))
+    bot_app.add_handler(CommandHandler("settings",       cmd_settings))
+    bot_app.add_handler(CommandHandler("portfolio",      cmd_portfolio))
+    bot_app.add_handler(CommandHandler("trades",         cmd_trades))
+    bot_app.add_handler(CommandHandler("cancel",         cmd_cancel))
 
     scheduler = AsyncIOScheduler(timezone="America/New_York")
     scheduler.add_job(
@@ -237,7 +296,7 @@ def main():
         web_app = web.Application()
         web_app["bot_app"] = application
         web_app.router.add_get("/trigger", handle_trigger)
-        web_app.router.add_get("/health", handle_health)
+        web_app.router.add_get("/health",  handle_health)
         port = int(os.getenv("PORT", 8080))
         runner = web.AppRunner(web_app)
         await runner.setup()
