@@ -2,7 +2,7 @@
 scanner.py - Elliott Wave + Fibonacci Scanner
 Berkshire Quality Screen + Wave 2 / Wave 4 / ABC setups
 LONG ONLY | Daily bars
-BUY = volume confirmed | WATCH = waiting for volume
+BUY = volume confirmed + auto-executed | WATCH = waiting for volume
 """
 import gc
 import time
@@ -62,7 +62,7 @@ def format_alert(sig):
     ]
 
     if label == "WATCH":
-        lines.append(f"** Volume low ({sig['vol_ratio']:.1f}x) -- wait for volume before entering **")
+        lines.append(f"** Volume {sig['vol_ratio']:.1f}x -- wait for volume before entering **")
 
     lines += [
         f"",
@@ -158,7 +158,7 @@ def format_summary(alerts, elapsed, universe_size):
     )
 
     if buys:
-        msg += f"\nTop BUY signals (volume confirmed):\n"
+        msg += f"\nTop BUY signals (auto-executed):\n"
         for a in buys[:5]:
             msg += f"  {a['ticker']} | {a['setup']} | Score {a['signal_score']:.0f} | R:R {a['rr_tp2']:.1f}x | +{a['tp2_pct']:.1f}%\n"
 
@@ -210,10 +210,7 @@ async def run_universe_scan(bot, chat_id, tickers=None):
     if not alerts:
         await bot.send_message(
             chat_id=chat_id,
-            text=(
-                "No Elliott Wave setups found today.\n"
-                "Try again tomorrow or use /check TICKER for specific stocks."
-            )
+            text="No Elliott Wave setups found today.\nTry again tomorrow or use /check TICKER."
         )
         return
 
@@ -224,8 +221,15 @@ async def run_universe_scan(bot, chat_id, tickers=None):
 
             # Auto-execute BUY signals on paper account
             if sig["signal"] == "BUY":
-                from trader import execute_signal, format_execution_result
-                import asyncio as _asyncio
-                loop   = _asyncio.get_event_loop()
-                result = await loop.run_in_executor(None, lambda: execute_signal(sig))
-                await bot.send_message(chat_id=chat_id, text=format_execution_result(result, sig))
+                try:
+                    from trader import execute_signal, format_execution_result
+                    result = await loop.run_in_executor(None, lambda s=sig: execute_signal(s))
+                    await bot.send_message(chat_id=chat_id, text=format_execution_result(result, sig))
+                except Exception:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"Trade execution error for {sig['ticker']}:\n{traceback.format_exc()[-300:]}"
+                    )
+
+        except Exception as e:
+            print(f"Failed to send {sig['ticker']}: {e}")
