@@ -282,11 +282,11 @@ def main():
     )
     scheduler.add_job(
         lambda: asyncio.create_task(scheduled_scan(bot_app.bot)),
-        "cron", day_of_week="mon-fri", hour="12", minute="0", id="scan_12pm"
+        "cron", day_of_week="mon-fri", hour="12", minute="30", id="scan_1230pm"
     )
     scheduler.add_job(
         lambda: asyncio.create_task(scheduled_scan(bot_app.bot)),
-        "cron", day_of_week="mon-fri", hour="14", minute="0", id="scan_2pm"
+        "cron", day_of_week="mon-fri", hour="14", minute="30", id="scan_230pm"
     )
 
     async def on_startup(application):
