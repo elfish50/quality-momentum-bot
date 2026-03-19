@@ -4,10 +4,8 @@ Auto-executes BUY signals on Alpaca paper account
 """
 import asyncio
 import json
-import os
 import traceback
 from datetime import datetime
-from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -19,19 +17,6 @@ async def scheduled_scan(bot):
     from scanner import run_universe_scan
     print(f"Scan starting at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     await run_universe_scan(bot, CHAT_ID)
-
-
-async def handle_trigger(request):
-    secret = os.getenv("CRON_SECRET", "")
-    incoming = request.rel_url.query.get("secret", "")
-    if secret and incoming != secret:
-        return web.Response(status=403, text="Forbidden")
-    asyncio.create_task(scheduled_scan(request.app["bot_app"].bot))
-    return web.Response(text="Scan triggered OK")
-
-
-async def handle_health(request):
-    return web.Response(text="OK")
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -51,7 +36,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/cancel - Cancel all open orders\n"
         "/strategy - How it works\n"
         "/settings - Bot settings\n"
-        "Auto-scans: Mon-Fri 10AM, 12PM, 2PM ET"
+        "Auto-scans: Mon-Fri 10AM, 12:30PM, 2:30PM ET"
     )
 
 
@@ -75,7 +60,7 @@ async def cmd_strategy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  BUY = volume confirmed (auto-executed)\n"
         "  WATCH = wait for volume before entering\n\n"
         "Quality: Berkshire screen (ROE/margins/EPS)\n"
-        "Account: $100k paper | Risk: $100/trade"
+        "Account: $1k paper | Risk: $100/trade"
     )
 
 
@@ -228,7 +213,8 @@ async def cmd_universe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         u     = load_universe()
         all_t = u.get("ALL", [])
         await update.message.reply_text(
-            f"Universe: {len(all_t):,} tickers from Alpaca"
+            f"Universe: {len(all_t):,} tickers (yfinance most actives)\n"
+            f"Sample: {', '.join(all_t[:10])}"
         )
     except Exception:
         await update.message.reply_text(f"Error:\n{traceback.format_exc()[-400:]}")
@@ -241,12 +227,13 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Strategy:  Elliott Wave + Fibonacci\n"
         "Direction: LONG ONLY\n"
         "Timeframe: Daily bars\n"
+        "Universe:  yfinance most actives (~100 tickers)\n"
         "Data:      Alpaca + Finnhub\n"
-        "Account:   $100k paper\n"
+        "Account:   $1k paper\n"
         "Risk:      $100/trade\n"
         "BUY:       volume confirmed (auto-executed)\n"
         "WATCH:     volume pending (alert only)\n"
-        "Schedule:  Mon-Fri 10AM, 12PM, 2PM ET"
+        "Schedule:  Mon-Fri 10AM, 12:30PM, 2:30PM ET"
     )
 
 
@@ -292,17 +279,7 @@ def main():
     async def on_startup(application):
         scheduler.start()
         await application.bot.delete_webhook(drop_pending_updates=True)
-        print("Scheduler started - scans at 10AM, 12PM, 2PM ET")
-        web_app = web.Application()
-        web_app["bot_app"] = application
-        web_app.router.add_get("/trigger", handle_trigger)
-        web_app.router.add_get("/health",  handle_health)
-        port = int(os.getenv("PORT", 8081))
-        runner = web.AppRunner(web_app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
-        print(f"Webhook listening on port {port}")
+        print("Scheduler started - scans at 10AM, 12:30PM, 2:30PM ET")
 
     bot_app.post_init = on_startup
     print("Quality Momentum Bot running!")
