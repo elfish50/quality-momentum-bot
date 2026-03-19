@@ -297,7 +297,7 @@ def main():
         web_app["bot_app"] = application
         web_app.router.add_get("/trigger", handle_trigger)
         web_app.router.add_get("/health",  handle_health)
-        port = int(os.getenv("PORT", 8080))
+        port = int(os.getenv("PORT", 8081))
         runner = web.AppRunner(web_app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", port)
