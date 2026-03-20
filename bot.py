@@ -4,13 +4,24 @@ Auto-executes BUY signals on Alpaca paper account
 """
 import asyncio
 import json
+import sys
 import traceback
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
+from telegram.error import Conflict
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
 from config import BOT_TOKEN, CHAT_ID
+
+
+async def error_handler(update, context):
+    error = context.error
+    if isinstance(error, Conflict):
+        print("ERROR: Another bot instance is running. Shutting down this instance.")
+        sys.exit(1)
+    print(f"Unhandled error: {error}")
+    traceback.print_exc()
 
 
 async def scheduled_scan(bot):
@@ -246,6 +257,8 @@ def main():
         pool_timeout=30.0,
     )
     bot_app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
+
+    bot_app.add_error_handler(error_handler)
 
     bot_app.add_handler(CommandHandler("start",          start))
     bot_app.add_handler(CommandHandler("help",           start))
