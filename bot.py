@@ -18,8 +18,8 @@ from config import BOT_TOKEN, CHAT_ID
 async def error_handler(update, context):
     error = context.error
     if isinstance(error, Conflict):
-        print("ERROR: Another bot instance is running. Shutting down this instance.")
-        sys.exit(1)
+        print("WARNING: Conflict detected, ignoring - Railway will manage restarts.")
+        return  # Don't kill the process
     print(f"Unhandled error: {error}")
     traceback.print_exc()
 
@@ -275,24 +275,31 @@ def main():
     bot_app.add_handler(CommandHandler("trades",         cmd_trades))
     bot_app.add_handler(CommandHandler("cancel",         cmd_cancel))
 
+    # Capture the running event loop for use by APScheduler threads
+    loop = None
+
     scheduler = AsyncIOScheduler(timezone="America/New_York")
+
     scheduler.add_job(
-        lambda: asyncio.create_task(scheduled_scan(bot_app.bot)),
+        lambda: asyncio.run_coroutine_threadsafe(scheduled_scan(bot_app.bot), loop),
         "cron", day_of_week="mon-fri", hour="10", minute="0", id="scan_10am"
     )
     scheduler.add_job(
-        lambda: asyncio.create_task(scheduled_scan(bot_app.bot)),
+        lambda: asyncio.run_coroutine_threadsafe(scheduled_scan(bot_app.bot), loop),
         "cron", day_of_week="mon-fri", hour="12", minute="30", id="scan_1230pm"
     )
     scheduler.add_job(
-        lambda: asyncio.create_task(scheduled_scan(bot_app.bot)),
+        lambda: asyncio.run_coroutine_threadsafe(scheduled_scan(bot_app.bot), loop),
         "cron", day_of_week="mon-fri", hour="14", minute="30", id="scan_230pm"
     )
 
     async def on_startup(application):
+        nonlocal loop
+        loop = asyncio.get_event_loop()  # Capture the running event loop
         scheduler.start()
         await application.bot.delete_webhook(drop_pending_updates=True)
         print("Scheduler started - scans at 10AM, 12:30PM, 2:30PM ET")
+        print(f"Next scan times: {[str(job.next_run_time) for job in scheduler.get_jobs()]}")
 
     bot_app.post_init = on_startup
     print("Quality Momentum Bot running!")
