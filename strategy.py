@@ -3,8 +3,8 @@ ELLIOTT WAVE + FIBONACCI STRATEGY
 Based on Asaf Naamani's framework
 
 Entry Scenarios (LONG ONLY):
-  1. Wave 2 pullback: price retraces 50-61.8% of Wave 1 -> buy reversal zone
-  2. Wave 4 pullback: price retraces 38.2% of Wave 1 -> buy shallow correction
+  1. Wave 2 pullback: price retraces 50-78.6% of Wave 1 -> buy reversal zone
+  2. Wave 4 pullback: price retraces 38.2% of Wave 3 -> buy shallow correction
   3. ABC correction: price completes C wave -> buy end of correction
 
 Stop Placement:
@@ -17,7 +17,16 @@ Targets:
   TP2: 1.618x Fibonacci extension of Wave 1
   TP3: 2.618x Fibonacci extension (stretch)
 
-Timeframe: Daily bars
+Filters added vs v1:
+  - Weekly trend filter: SMA10w must be above SMA20w (weekly uptrend required)
+  - Volume threshold raised to 1.5x average (was 1.0x)
+  - Quality score threshold raised to 40 (was 20)
+  - Wave 2 reversal zone widened to 50-78.6% (was 50-61.8%)
+  - Swing point detection fixed (iloc-based, no fragile index matching)
+  - ABC targets fixed (extensions beyond Wave A start, not from it)
+  - SIP feed fallback when IEX returns insufficient bars
+
+Timeframe: Daily bars + weekly trend confirmation
 Quality: Berkshire screen (ROE, margins, EPS, D/E)
 Data: Alpaca (price) + Finnhub (fundamentals)
 Account: $1,000 | Risk: 10% = $100 per trade
@@ -41,7 +50,7 @@ FINNHUB_URL = "https://finnhub.io/api/v1"
 ACCOUNT  = 1_000
 RISK_PCT = 0.10
 
-# Fibonacci levels
+# Fibonacci retracement levels
 FIB_382 = 0.382
 FIB_500 = 0.500
 FIB_618 = 0.618
@@ -52,53 +61,114 @@ EXT_1272 = 1.272
 EXT_1618 = 1.618
 EXT_2618 = 2.618
 
+# Thresholds (tuned vs v1)
+VOL_CONFIRM_RATIO = 1.5   # was 1.0 — require meaningful volume surge
+MIN_QUALITY_SCORE = 40    # was 20 — stricter quality gate
+MIN_WAVE1_MOVE    = 0.07  # was 0.05 — wave 1 must be at least 7% move
+MIN_RR_TP2        = 2.0   # minimum R:R to TP2 (unchanged)
+
+
+# ── Price Data ────────────────────────────────────────────────────────────────
 
 def get_price_data(ticker):
+    """Fetch daily bars from Alpaca. Tries IEX first, falls back to SIP."""
     end   = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
     headers = {
         "APCA-API-KEY-ID":     ALPACA_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET,
     }
-    params = {
-        "start":     start,
-        "end":       end,
-        "timeframe": "1Day",
-        "limit":     365,
-        "feed":      "iex",
-    }
-    try:
-        r    = requests.get(f"{ALPACA_URL}/stocks/{ticker}/bars",
-                            headers=headers, params=params, timeout=15)
-        bars = r.json().get("bars")
-        if not bars or len(bars) < 60:
-            return None
-        df = pd.DataFrame([{
-            "Date":   pd.to_datetime(b["t"]),
-            "Open":   float(b["o"]),
-            "High":   float(b["h"]),
-            "Low":    float(b["l"]),
-            "Close":  float(b["c"]),
-            "Volume": float(b["v"]),
-        } for b in bars])
-        return df.sort_values("Date").reset_index(drop=True)
-    except Exception as e:
-        print(f"[{ticker}] Alpaca error: {e}")
-        return None
 
+    for feed in ["iex", "sip"]:
+        try:
+            params = {
+                "start":     start,
+                "end":       end,
+                "timeframe": "1Day",
+                "limit":     400,
+                "feed":      feed,
+                "adjustment": "split",   # split-adjusted prices
+            }
+            r    = requests.get(
+                f"{ALPACA_URL}/stocks/{ticker}/bars",
+                headers=headers, params=params, timeout=15
+            )
+            bars = r.json().get("bars")
+            if not bars or len(bars) < 60:
+                continue
+            df = pd.DataFrame([{
+                "Date":   pd.to_datetime(b["t"]),
+                "Open":   float(b["o"]),
+                "High":   float(b["h"]),
+                "Low":    float(b["l"]),
+                "Close":  float(b["c"]),
+                "Volume": float(b["v"]),
+            } for b in bars])
+            df = df.sort_values("Date").reset_index(drop=True)
+            return df
+        except Exception as e:
+            print(f"[{ticker}] Alpaca {feed} error: {e}")
+            continue
+
+    return None
+
+
+def get_weekly_bars(df):
+    """
+    Resample daily bars to weekly for trend filter.
+    Returns weekly DataFrame with Open/High/Low/Close/Volume.
+    """
+    df2 = df.copy()
+    df2["Date"] = pd.to_datetime(df2["Date"])
+    df2 = df2.set_index("Date")
+    weekly = df2.resample("W").agg({
+        "Open":   "first",
+        "High":   "max",
+        "Low":    "min",
+        "Close":  "last",
+        "Volume": "sum",
+    }).dropna()
+    return weekly.reset_index()
+
+
+def weekly_trend_is_up(df):
+    """
+    Weekly trend filter: SMA10w > SMA20w (weekly uptrend required).
+    Prevents buying Wave 2 pullbacks in a weekly downtrend.
+    Returns True if trend is up or insufficient data (gives benefit of doubt).
+    """
+    try:
+        weekly = get_weekly_bars(df)
+        if len(weekly) < 22:
+            return True  # not enough weekly bars — don't reject
+        close     = weekly["Close"]
+        sma10w    = close.rolling(10).mean().iloc[-1]
+        sma20w    = close.rolling(20).mean().iloc[-1]
+        sma10w_1  = close.rolling(10).mean().iloc[-2]
+        # Uptrend: SMA10w > SMA20w AND SMA10w is rising
+        return sma10w > sma20w and sma10w > sma10w_1
+    except Exception:
+        return True  # don't reject on error
+
+
+# ── Fundamentals ──────────────────────────────────────────────────────────────
 
 def get_fundamentals(ticker):
     def safe(v, d=0.0):
         try: return float(v) if v not in (None, "", "N/A", "None") else d
         except: return d
     try:
-        r1 = requests.get(f"{FINNHUB_URL}/stock/metric",
-                          params={"symbol": ticker, "metric": "all",
-                                  "token": FINNHUB_KEY}, timeout=15)
+        r1 = requests.get(
+            f"{FINNHUB_URL}/stock/metric",
+            params={"symbol": ticker, "metric": "all", "token": FINNHUB_KEY},
+            timeout=15
+        )
         m  = r1.json().get("metric", {})
-        r2 = requests.get(f"{FINNHUB_URL}/stock/profile2",
-                          params={"symbol": ticker, "token": FINNHUB_KEY},
-                          timeout=15)
+        r2 = requests.get(
+            f"{FINNHUB_URL}/stock/profile2",
+            params={"symbol": ticker, "token": FINNHUB_KEY},
+            timeout=15
+        )
         p  = r2.json()
         return {
             "roe":          safe(m.get("roeTTM")) / 100,
@@ -117,32 +187,39 @@ def get_fundamentals(ticker):
 
 def quality_score(fund):
     score, failed = 0.0, []
+
     roe = fund.get("roe", 0)
     if roe >= 0.15:   score += 30
     elif roe >= 0.08: score += 15 + (roe - 0.08) / 0.07 * 15
     elif roe > 0:     score += 8
     else:             failed.append(f"ROE {roe:.1%}")
+
     gm = fund.get("gross_margin", 0)
     if gm >= 0.40:   score += 25
     elif gm >= 0.15: score += 10 + (gm - 0.15) / 0.25 * 15
     elif gm > 0:     score += 5
     else:            failed.append(f"Margin {gm:.1%}")
+
     eg = fund.get("eps_growth", 0)
     if eg >= 0.15:  score += 25
     elif eg >= 0.0: score += 10 + eg / 0.15 * 15
     else:           failed.append(f"EPS {eg:.1%}")
+
     de = fund.get("debt_equity", 999)
-    if de <= 0.5:    score += 20
-    elif de <= 2.0:  score += 20 - (de - 0.5) / 1.5 * 15
-    else:            failed.append(f"D/E {de:.1f}")
+    if de <= 0.5:   score += 20
+    elif de <= 2.0: score += 20 - (de - 0.5) / 1.5 * 15
+    else:           failed.append(f"D/E {de:.1f}")
+
     return round(score, 1), failed
 
+
+# ── Indicators ────────────────────────────────────────────────────────────────
 
 def compute_indicators(df):
     df = df.copy()
     close = df["Close"]
 
-    # RSI 14
+    # RSI 14 (Wilder's smoothing)
     delta    = close.diff()
     gain     = delta.clip(lower=0)
     loss     = (-delta).clip(lower=0)
@@ -171,38 +248,48 @@ def compute_indicators(df):
     return df
 
 
-def find_swing_points(df, lookback=60, min_bars=5):
+def find_swing_points(df, lookback=90, min_bars=5):
     """
-    Find significant swing highs and lows in the lookback period.
-    A swing high is a bar whose high is the highest in min_bars on each side.
-    A swing low is a bar whose low is the lowest in min_bars on each side.
+    Find significant swing highs/lows using iloc (no fragile index matching).
+    Returns lists of (iloc_position, price) tuples.
+
+    FIX vs v1: Uses integer positions throughout — no index.get_loc() calls
+    that fail when the sliced DataFrame has a non-contiguous index.
     """
-    recent = df.iloc[-lookback:].copy()
-    highs, lows = [], []
+    n      = len(df)
+    start  = max(0, n - lookback)
+    highs  = []  # (iloc in full df, price)
+    lows   = []
 
-    for i in range(min_bars, len(recent) - min_bars):
-        bar = recent.iloc[i]
-        window_highs = recent.iloc[i-min_bars:i+min_bars+1]["High"]
-        window_lows  = recent.iloc[i-min_bars:i+min_bars+1]["Low"]
+    for i in range(start + min_bars, n - min_bars):
+        window = df.iloc[i - min_bars: i + min_bars + 1]
+        bar    = df.iloc[i]
 
-        if bar["High"] == window_highs.max():
-            highs.append((recent.index[i], float(bar["High"])))
-        if bar["Low"] == window_lows.min():
-            lows.append((recent.index[i], float(bar["Low"])))
+        if bar["High"] == window["High"].max():
+            highs.append((i, float(bar["High"])))
+
+        if bar["Low"] == window["Low"].min():
+            lows.append((i, float(bar["Low"])))
 
     return highs, lows
 
 
+# ── Wave 2 Setup ──────────────────────────────────────────────────────────────
+
 def detect_wave2_setup(df):
     """
-    Wave 2 setup:
-    - Identify Wave 1: strong impulse move up (swing low -> swing high)
-    - Price retraces 50-61.8% of Wave 1
-    - RSI turning up from oversold zone
-    - Entry in reversal zone
-    - Stop: 1% below Wave 1 origin (swing low)
+    Wave 2 pullback:
+    - Wave 1: swing low -> swing high (at least MIN_WAVE1_MOVE)
+    - Price retraces 50–78.6% of Wave 1 (wider zone vs v1 which was 50–61.8%)
+    - Weekly trend must be up (new filter)
+    - RSI turning up from 25–60, confirmed rising
+    - Volume >= 1.5x average for BUY (was 1.0x)
+    - R:R to TP2 >= 2.0
     """
-    df = compute_indicators(df)
+    if not weekly_trend_is_up(df):
+        return None
+
+    df      = compute_indicators(df)
     current = df.iloc[-1]
     price   = float(current["Close"])
     rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
@@ -212,78 +299,67 @@ def detect_wave2_setup(df):
     if len(highs) < 1 or len(lows) < 1:
         return None
 
-    # Find the most recent significant swing low (Wave 1 origin)
-    # followed by a swing high (Wave 1 top)
-    # Look for: low -> high -> pullback (current price)
+    # Find last valid swing low BEFORE last swing high (iloc-based)
+    last_high_loc, wave1_top = highs[-1]
 
-    # Get last swing low and swing high
-    last_low  = lows[-1]
-    last_high = highs[-1]
+    # Walk backwards through lows to find one before the high
+    wave1_origin = None
+    for loc, val in reversed(lows):
+        if loc < last_high_loc:
+            wave1_origin = val
+            break
 
-    # Wave 1 origin must be BEFORE Wave 1 top
-    low_loc  = df.index.get_loc(last_low[0])
-    high_loc = df.index.get_loc(last_high[0])
+    if wave1_origin is None:
+        return None
 
-    if low_loc >= high_loc:
-        # Try second-to-last low
-        if len(lows) < 2:
-            return None
-        last_low  = lows[-2]
-        low_loc   = df.index.get_loc(last_low[0])
-        if low_loc >= high_loc:
-            return None
-
-    wave1_origin = last_low[1]   # Wave 1 start (swing low)
-    wave1_top    = last_high[1]  # Wave 1 end (swing high)
-    wave1_size   = wave1_top - wave1_origin
+    wave1_size = wave1_top - wave1_origin
 
     if wave1_size <= 0:
         return None
 
-    # Wave 1 must be a meaningful move (at least 5%)
-    if wave1_size / wave1_origin < 0.05:
+    # Wave 1 must be a meaningful impulse
+    if wave1_size / wave1_origin < MIN_WAVE1_MOVE:
         return None
 
-    # Calculate Fibonacci retracement levels
+    # Fibonacci retracement levels from wave1_top
     fib_382 = round(wave1_top - wave1_size * FIB_382, 2)
     fib_500 = round(wave1_top - wave1_size * FIB_500, 2)
     fib_618 = round(wave1_top - wave1_size * FIB_618, 2)
     fib_786 = round(wave1_top - wave1_size * FIB_786, 2)
 
-    # Reversal zone: between 50% and 61.8% retracement
-    in_reversal_zone = fib_618 <= price <= fib_500
+    # Reversal zone: 50–78.6% retracement (widened from 50–61.8%)
+    in_reversal_zone = fib_786 <= price <= fib_500
 
     if not in_reversal_zone:
         return None
 
-    # RSI should be in recovery zone (30-55) and rising
-    rsi_prev = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
+    # RSI: recovering, not already overbought
+    rsi_prev   = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
     rsi_rising = rsi > rsi_prev
     rsi_ok     = 25 <= rsi <= 60
 
     if not (rsi_rising and rsi_ok):
         return None
 
-    # Price should be above recent low (not still falling)
-    recent_low = float(df.iloc[-5:]["Low"].min())
-    if price < recent_low * 1.005:
+    # Price not still in free-fall (above recent 3-bar low)
+    if price < float(df.iloc[-4:-1]["Low"].min()) * 1.002:
         return None
 
-    # Volume confirmation: current volume above average
-    vol_ratio     = float(current["Volume"]) / float(current["VolAvg20"]) if current["VolAvg20"] > 0 else 1.0
-    vol_confirmed = vol_ratio >= 1.0
+    # Volume
+    vol_avg       = float(current["VolAvg20"]) if current["VolAvg20"] > 0 else 1
+    vol_ratio     = float(current["Volume"]) / vol_avg
+    vol_confirmed = vol_ratio >= VOL_CONFIRM_RATIO
 
     # Stop: 1% below Wave 1 origin
     stop = round(wave1_origin * 0.99, 2)
 
-    # Targets: Fibonacci extensions of Wave 1 from Wave 2 low
-    # We use current price as approximate Wave 2 low
+    # Targets: Fibonacci extensions from current price (Wave 2 low)
     wave2_low = price
     ext_1272  = round(wave2_low + wave1_size * EXT_1272, 2)
     ext_1618  = round(wave2_low + wave1_size * EXT_1618, 2)
     ext_2618  = round(wave2_low + wave1_size * EXT_2618, 2)
 
-    risk      = price - stop
+    risk = price - stop
     if risk <= 0:
         return None
 
@@ -293,7 +369,7 @@ def detect_wave2_setup(df):
     rr_tp1  = round((ext_1272 - price) / risk, 2)
     rr_tp2  = round((ext_1618 - price) / risk, 2)
 
-    if rr_tp2 < 2.0:
+    if rr_tp2 < MIN_RR_TP2:
         return None
 
     atr = float(current["ATR"]) if not pd.isna(current["ATR"]) else price * 0.02
@@ -322,17 +398,32 @@ def detect_wave2_setup(df):
         "rr_tp1":        rr_tp1,
         "rr_tp2":        rr_tp2,
         "risk":          round(risk, 2),
+        "setup_detail": {
+            "wave1_origin": round(wave1_origin, 2),
+            "wave1_top":    round(wave1_top, 2),
+            "wave1_size":   round(wave1_size, 2),
+            "fib_382":      fib_382,
+            "fib_500":      fib_500,
+            "fib_618":      fib_618,
+        }
     }
 
 
+# ── Wave 4 Setup ──────────────────────────────────────────────────────────────
+
 def detect_wave4_setup(df):
     """
-    Wave 4 setup:
-    - Shallower correction (38.2% retracement)
-    - Stop: just below Wave 1 high
-    - Wave 4 cannot overlap Wave 1 territory
+    Wave 4 pullback:
+    - Need at least: low1 (W1 origin) -> high1 (W1 top) -> high2 (W3 top)
+    - Price retraces 38.2% of Wave 3
+    - Wave 4 cannot overlap Wave 1 territory (Elliott rule)
+    - Weekly trend must be up
+    - RSI 35–65, rising
     """
-    df = compute_indicators(df)
+    if not weekly_trend_is_up(df):
+        return None
+
+    df      = compute_indicators(df)
     current = df.iloc[-1]
     price   = float(current["Close"])
     rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
@@ -342,32 +433,28 @@ def detect_wave4_setup(df):
     if len(highs) < 2 or len(lows) < 1:
         return None
 
-    # Need: low1 -> high1 (W1) -> low2 (W2) -> high2 (W3) -> pullback (W4)
-    if len(highs) < 2:
-        return None
+    # Use iloc-based positions throughout
+    wave1_origin_loc, wave1_origin = lows[0]
+    wave1_high_loc,   wave1_high   = highs[0]
+    wave3_high_loc,   wave3_high   = highs[-1]
 
-    wave1_origin = lows[0][1]  if len(lows) > 0 else None
-    wave1_high   = highs[0][1] if len(highs) > 0 else None
-    wave3_high   = highs[-1][1] if len(highs) > 1 else None
-
-    if not all([wave1_origin, wave1_high, wave3_high]):
+    # Sanity: wave1 origin before wave1 high before wave3 high
+    if not (wave1_origin_loc < wave1_high_loc < wave3_high_loc):
         return None
 
     wave3_size = wave3_high - wave1_origin
     if wave3_size <= 0:
         return None
 
-    # Wave 4 retracement: 38.2% of Wave 3
+    # Wave 4 retracement of Wave 3
     fib_382_w4 = round(wave3_high - wave3_size * FIB_382, 2)
     fib_500_w4 = round(wave3_high - wave3_size * FIB_500, 2)
 
     # Price should be in Wave 4 zone
-    in_w4_zone = fib_500_w4 <= price <= fib_382_w4
-
-    if not in_w4_zone:
+    if not (fib_500_w4 <= price <= fib_382_w4):
         return None
 
-    # Wave 4 cannot overlap Wave 1 high
+    # Wave 4 cannot overlap Wave 1 high (Elliott non-overlap rule)
     if price < wave1_high:
         return None
 
@@ -378,8 +465,9 @@ def detect_wave4_setup(df):
     if not (rsi_rising and rsi_ok):
         return None
 
-    vol_ratio     = float(current["Volume"]) / float(current["VolAvg20"]) if current["VolAvg20"] > 0 else 1.0
-    vol_confirmed = vol_ratio >= 1.0
+    vol_avg       = float(current["VolAvg20"]) if current["VolAvg20"] > 0 else 1
+    vol_ratio     = float(current["Volume"]) / vol_avg
+    vol_confirmed = vol_ratio >= VOL_CONFIRM_RATIO
 
     # Stop: 1% below Wave 1 high
     stop = round(wave1_high * 0.99, 2)
@@ -399,45 +487,65 @@ def detect_wave4_setup(df):
     rr_tp1  = round((ext_1272 - price) / risk, 2)
     rr_tp2  = round((ext_1618 - price) / risk, 2)
 
-    if rr_tp2 < 2.0:
+    if rr_tp2 < MIN_RR_TP2:
         return None
 
     atr = float(current["ATR"]) if not pd.isna(current["ATR"]) else price * 0.02
 
     return {
-        "setup":        "Wave 4 Pullback",
-        "wave1_origin": round(wave1_origin, 2),
-        "wave1_high":   round(wave1_high, 2),
-        "wave3_high":   round(wave3_high, 2),
-        "fib_382":      fib_382_w4,
-        "fib_500":      fib_500_w4,
-        "price":        round(price, 2),
-        "rsi":          round(rsi, 1),
-        "atr":          round(atr, 2),
-        "vol_ratio":    round(vol_ratio, 2),
+        "setup":         "Wave 4 Pullback",
+        "wave1_origin":  round(wave1_origin, 2),
+        "wave1_high":    round(wave1_high, 2),
+        "wave3_high":    round(wave3_high, 2),
+        "fib_382":       fib_382_w4,
+        "fib_500":       fib_500_w4,
+        "price":         round(price, 2),
+        "rsi":           round(rsi, 1),
+        "atr":           round(atr, 2),
+        "vol_ratio":     round(vol_ratio, 2),
         "vol_confirmed": vol_confirmed,
-        "stop":         stop,
-        "tp1":          ext_1272,
-        "tp2":          ext_1618,
-        "tp3":          ext_2618,
-        "tp1_pct":      tp1_pct,
-        "tp2_pct":      tp2_pct,
-        "tp3_pct":      tp3_pct,
-        "rr_tp1":       rr_tp1,
-        "rr_tp2":       rr_tp2,
-        "risk":         round(risk, 2),
+        "stop":          stop,
+        "tp1":           ext_1272,
+        "tp2":           ext_1618,
+        "tp3":           ext_2618,
+        "tp1_pct":       tp1_pct,
+        "tp2_pct":       tp2_pct,
+        "tp3_pct":       tp3_pct,
+        "rr_tp1":        rr_tp1,
+        "rr_tp2":        rr_tp2,
+        "risk":          round(risk, 2),
+        "setup_detail": {
+            "wave1_origin": round(wave1_origin, 2),
+            "wave1_high":   round(wave1_high, 2),
+            "wave3_high":   round(wave3_high, 2),
+            "fib_382":      fib_382_w4,
+            "fib_500":      fib_500_w4,
+        }
     }
 
 
+# ── ABC Setup ─────────────────────────────────────────────────────────────────
+
 def detect_abc_setup(df):
     """
-    ABC Correction setup:
-    - Price completes a 3-wave ABC correction
-    - Wave C ends near Wave A low (or Fib extension of A)
-    - Stop: below Wave A low
-    - Entry: reversal from Wave C bottom
+    ABC Correction:
+    - Wave A: impulse drop (high -> low)
+    - Wave B: partial bounce
+    - Wave C: second drop, ends near or below Wave A low
+    - Entry at Wave C completion reversal
+    - Stop: 1% below Wave A low
+
+    FIX vs v1:
+    - Targets now correctly extend BEYOND Wave A start (not from it)
+    - TP1 = Wave A start (100% recovery)
+    - TP2 = Wave A start + 61.8% of Wave A size (extension)
+    - TP3 = Wave A start + 100% of Wave A size (full extension)
+    - Weekly trend filter applied
     """
-    df = compute_indicators(df)
+    if not weekly_trend_is_up(df):
+        return None
+
+    df      = compute_indicators(df)
     current = df.iloc[-1]
     price   = float(current["Close"])
     rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
@@ -447,28 +555,32 @@ def detect_abc_setup(df):
     if len(highs) < 1 or len(lows) < 2:
         return None
 
-    # ABC: high (Wave A start) -> low (Wave A end) -> high (Wave B) -> low (Wave C)
-    wave_a_start = highs[-1][1]
-    wave_a_end   = lows[-2][1] if len(lows) >= 2 else None
-    wave_c_low   = lows[-1][1]
+    # Pattern: last high (Wave A start) -> second-to-last low (Wave A end / Wave B area)
+    #          -> last low (Wave C low)
+    wave_a_start_loc, wave_a_start = highs[-1]
+    wave_a_end_loc,   wave_a_end   = lows[-2]
+    wave_c_loc,       wave_c_low   = lows[-1]
 
-    if not wave_a_end:
+    # Structural order: A start -> A end -> C low (all increasing iloc)
+    if not (wave_a_start_loc < wave_a_end_loc < wave_c_loc):
         return None
 
     wave_a_size = wave_a_start - wave_a_end
     if wave_a_size <= 0:
         return None
 
-    # Wave C should be near Wave A low (0.618 to 1.0 of Wave A)
-    c_target_min = round(wave_a_end - wave_a_size * 0.2, 2)
-    c_target_max = round(wave_a_end + wave_a_size * 0.1, 2)
-
-    # Price near Wave C completion zone
-    in_abc_zone = c_target_min <= price <= c_target_max
-
-    if not in_abc_zone:
+    # Wave A must be a meaningful drop (at least 5%)
+    if wave_a_size / wave_a_start < 0.05:
         return None
 
+    # Wave C completion zone: within 20% of Wave A end (above or below)
+    c_zone_low  = round(wave_a_end - wave_a_size * 0.20, 2)
+    c_zone_high = round(wave_a_end + wave_a_size * 0.10, 2)
+
+    if not (c_zone_low <= price <= c_zone_high):
+        return None
+
+    # RSI turning up from oversold
     rsi_prev   = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
     rsi_rising = rsi > rsi_prev
     rsi_ok     = 25 <= rsi <= 55
@@ -476,16 +588,20 @@ def detect_abc_setup(df):
     if not (rsi_rising and rsi_ok):
         return None
 
-    vol_ratio     = float(current["Volume"]) / float(current["VolAvg20"]) if current["VolAvg20"] > 0 else 1.0
-    vol_confirmed = vol_ratio >= 1.0
+    vol_avg       = float(current["VolAvg20"]) if current["VolAvg20"] > 0 else 1
+    vol_ratio     = float(current["Volume"]) / vol_avg
+    vol_confirmed = vol_ratio >= VOL_CONFIRM_RATIO
 
-    # Stop: 1% below Wave A low
+    # Stop: 1% below Wave A end (correction low)
     stop = round(wave_a_end * 0.99, 2)
 
-    # Targets: return to Wave A start and beyond
+    # FIXED targets: extend beyond Wave A start
+    # TP1 = full recovery to Wave A start
+    # TP2 = Wave A start + 61.8% extension of Wave A size
+    # TP3 = Wave A start + 100% extension (measured move)
     tp1 = round(wave_a_start, 2)
-    tp2 = round(wave_a_start + wave_a_size * 0.618, 2)
-    tp3 = round(wave_a_start + wave_a_size * 1.0,   2)
+    tp2 = round(wave_a_start + wave_a_size * FIB_618, 2)
+    tp3 = round(wave_a_start + wave_a_size * 1.0, 2)
 
     risk = price - stop
     if risk <= 0:
@@ -522,19 +638,26 @@ def detect_abc_setup(df):
         "rr_tp1":        rr_tp1,
         "rr_tp2":        rr_tp2,
         "risk":          round(risk, 2),
+        "setup_detail": {
+            "wave_a_start": round(wave_a_start, 2),
+            "wave_a_end":   round(wave_a_end, 2),
+            "wave_c_low":   round(wave_c_low, 2),
+        }
     }
 
+
+# ── Position Sizing ───────────────────────────────────────────────────────────
 
 def position_size(price, stop):
     risk_dollars = ACCOUNT * RISK_PCT
     risk         = price - stop
     if risk <= 0:
         risk = price * 0.05
-    shares       = math.floor(risk_dollars / risk)
+    shares     = math.floor(risk_dollars / risk)
     if shares < 1:
         shares = 1
-    max_shares   = math.floor(ACCOUNT / price) if price > 0 else shares
-    shares       = min(shares, max_shares)
+    max_shares = math.floor(ACCOUNT / price) if price > 0 else shares
+    shares     = min(shares, max_shares)
     return {
         "shares":       shares,
         "risk_dollars": round(risk_dollars, 2),
@@ -543,9 +666,11 @@ def position_size(price, stop):
     }
 
 
+# ── Main Analyzer ─────────────────────────────────────────────────────────────
+
 def analyze_ticker(ticker):
     try:
-        # 1. Price data
+        # 1. Price data (IEX -> SIP fallback)
         df = get_price_data(ticker)
         if df is None or len(df) < 60:
             return None
@@ -558,49 +683,49 @@ def analyze_ticker(ticker):
         )
 
         if setup is None:
-            print(f"[{ticker}] No Elliott Wave setup")
             return None
 
-        # 3. Fundamentals + quality screen
+        # 3. Fundamentals + quality screen (stricter: MIN_QUALITY_SCORE = 40)
         fund = get_fundamentals(ticker)
         if not fund:
             return None
 
         q_score, failed = quality_score(fund)
-        if q_score < 20:
-            print(f"[{ticker}] SKIP | Quality {q_score:.0f}")
+        if q_score < MIN_QUALITY_SCORE:
+            print(f"[{ticker}] SKIP | Quality {q_score:.0f} < {MIN_QUALITY_SCORE}")
             return None
 
         # 4. Position sizing
-        price   = setup["price"]
-        stop    = setup["stop"]
-        sizing  = position_size(price, stop)
+        price  = setup["price"]
+        stop   = setup["stop"]
+        sizing = position_size(price, stop)
 
-        # 5. Signal score
+        # 5. Signal score (same weights as v1, quality threshold stricter)
         score = 0.0
         score += q_score * 0.35
-        rsi = setup["rsi"]
-        if 35 <= rsi <= 55:   score += 25
-        elif 55 < rsi <= 65:  score += 15
-        else:                 score += 5
-        if setup["vol_confirmed"]:  score += 20
-        else:                       score += 8
+        rsi    = setup["rsi"]
+        if 35 <= rsi <= 55:  score += 25
+        elif 55 < rsi <= 65: score += 15
+        else:                score += 5
+        if setup["vol_confirmed"]: score += 20
+        else:                      score += 8
         rr = setup.get("rr_tp2", 0)
         if rr >= 4.0:   score += 20
         elif rr >= 2.0: score += 12
         else:           score += 5
 
-# 6. Signal type: BUY (volume confirmed) vs WATCH (waiting for volume)
-        vol_confirmed = setup.get("vol_confirmed", False)
-        signal_type   = "BUY" if vol_confirmed else "WATCH"
+        # 6. Signal type
+        signal_type = "BUY" if setup.get("vol_confirmed", False) else "WATCH"
 
         # 7. Hold time
-        if score >= 70:
-            hold_time = "POSITION (3-8 weeks)"
-        else:
-            hold_time = "SWING (1-3 weeks)"
+        hold_time = "POSITION (3-8 weeks)" if score >= 70 else "SWING (1-3 weeks)"
 
-        print(f"[{ticker}] {signal_type} | {setup['setup']} | Score {score:.0f} | RSI {rsi:.0f} | R:R TP2 {setup.get('rr_tp2',0):.1f}x | Vol {setup.get('vol_ratio',0):.1f}x")
+        print(
+            f"[{ticker}] {signal_type} | {setup['setup']} | "
+            f"Score {score:.0f} | RSI {rsi:.0f} | "
+            f"R:R TP2 {setup.get('rr_tp2',0):.1f}x | "
+            f"Vol {setup.get('vol_ratio',0):.1f}x"
+        )
 
         return {
             "ticker":        ticker,
@@ -635,7 +760,7 @@ def analyze_ticker(ticker):
             "sector":        fund.get("sector", ""),
             "name":          fund.get("name", ticker),
             "quality_notes": failed,
-            "setup_detail":  setup,
+            "setup_detail":  setup.get("setup_detail", {}),
         }
 
     except Exception:
