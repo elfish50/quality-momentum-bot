@@ -10,10 +10,12 @@ Bracket order per BUY signal:
   - Stop loss at invalidation level
   - Take profit limit at TP2 (1.618x Fib extension)
 
-Protective Put:
-  - After each BUY, checks Alpaca options chain for a put near the stop price
-  - Finds nearest strike <= stop, nearest expiry 21-60 days out
-  - Appended to the trade confirmation message
+Protective Put (auto-placed alongside every BUY):
+  - Finds nearest put strike at or below stop price, expiry 21-60 days out
+  - Contracts = floor(shares / 100)  — 1 contract covers 100 shares
+  - If shares < 100, no put is placed (can't cover a partial lot)
+  - Places a market order for the put on the same paper account
+  - If options are unavailable for the ticker, reports cleanly — stock trade unaffected
 
 Telegram commands:
   /portfolio - open positions + P&L
@@ -140,35 +142,101 @@ def get_protective_put(ticker: str, stop_price: float, entry_price: float) -> di
         return None
 
 
-def format_put_block(put: dict | None, stop: float, ticker: str) -> str:
+def format_put_block(put: dict | None, stop: float, ticker: str, contracts: int = 0) -> str:
     """
-    Formats the protective put info block for the Telegram message.
+    Formats the protective put block for the Telegram message.
+    Shows whether the order was placed, skipped, or unavailable.
     """
     if put is None:
         return (
             f"\n🛡 Protective Put\n"
             f"{'─'*36}\n"
             f"No listed puts found for {ticker}\n"
-            f"(Options may not be available for this stock)"
+            f"(Options not available — stock trade unaffected)"
         )
 
-    hedge_pct = round((put["strike"] / stop - 1) * 100, 1)  # how far strike is from stop
-    sign      = f"{hedge_pct:+.1f}%" if hedge_pct != 0 else "at stop"
+    if contracts == 0:
+        return (
+            f"\n🛡 Protective Put — SKIPPED\n"
+            f"{'─'*36}\n"
+            f"Contract: {put['symbol']}\n"
+            f"Strike:   ${put['strike']:.2f}  |  Expiry: {put['expiry']}\n"
+            f"Mid:      ${put['mid']:.2f}  |  IV: {put['iv']:.1f}%\n"
+            f"Reason:   Position < 100 shares — no full lot to hedge"
+        )
 
-    return (
-        f"\n🛡 Protective Put Available\n"
-        f"{'─'*36}\n"
-        f"Contract: {put['symbol']}\n"
-        f"Strike:   ${put['strike']:.2f}  ({sign} vs stop)\n"
-        f"Expiry:   {put['expiry']}\n"
-        f"Bid/Ask:  ${put['bid']:.2f} / ${put['ask']:.2f}\n"
-        f"Mid:      ${put['mid']:.2f}\n"
-        f"IV:       {put['iv']:.1f}%\n"
-        f"Delta:    {put['delta']:.3f}\n"
-        f"Cost:     ${put['cost']:.2f} / contract (100 shares)\n"
-        f"{'─'*36}\n"
-        f"Hedge: Buy 1 put to cap loss below ${put['strike']:.2f}"
-    )
+    order_status = put.get("order_status", "unknown")
+    order_id     = put.get("order_id", "")
+    order_error  = put.get("order_error", "")
+
+    if order_status == "placed":
+        return (
+            f"\n🛡 Protective Put — ORDER PLACED ✅\n"
+            f"{'─'*36}\n"
+            f"Contract: {put['symbol']}\n"
+            f"Strike:   ${put['strike']:.2f}  |  Expiry: {put['expiry']}\n"
+            f"Bid/Ask:  ${put['bid']:.2f} / ${put['ask']:.2f}  |  Mid: ${put['mid']:.2f}\n"
+            f"IV:       {put['iv']:.1f}%  |  Delta: {put['delta']:.3f}\n"
+            f"Qty:      {contracts} contract(s)  ({contracts * 100} shares covered)\n"
+            f"Est cost: ${put['mid'] * contracts * 100:.2f}\n"
+            f"Order ID: {order_id[:16]}...\n"
+            f"{'─'*36}\n"
+            f"Hedge active: loss capped below ${put['strike']:.2f}"
+        )
+    else:
+        return (
+            f"\n🛡 Protective Put — ORDER FAILED ⚠️\n"
+            f"{'─'*36}\n"
+            f"Contract: {put['symbol']}\n"
+            f"Strike:   ${put['strike']:.2f}  |  Expiry: {put['expiry']}\n"
+            f"Error:    {order_error[:150]}\n"
+            f"Action:   Place manually on Alpaca if desired"
+        )
+
+
+def execute_put_order(put: dict, contracts: int) -> dict:
+    """
+    Places a market BUY order for the protective put on the paper account.
+
+    Args:
+        put:       dict from get_protective_put() — must have 'symbol' key
+        contracts: number of contracts to buy (floor(shares / 100))
+
+    Returns the put dict updated with order_status, order_id, order_error.
+    """
+    if contracts <= 0:
+        put["order_status"] = "skipped"
+        return put
+
+    try:
+        order = requests.post(
+            f"{PAPER_URL}/orders",
+            headers=HEADERS,
+            json={
+                "symbol":        put["symbol"],   # OCC option symbol e.g. TSLA260417P00330000
+                "qty":           str(contracts),
+                "side":          "buy",
+                "type":          "market",
+                "time_in_force": "day",
+            },
+            timeout=15
+        ).json()
+
+        if isinstance(order, dict) and "id" in order:
+            put["order_status"] = "placed"
+            put["order_id"]     = order["id"]
+            print(f"Put order placed: {put['symbol']} x{contracts} | ID {order['id']}")
+        else:
+            msg = order.get("message", str(order)[:200]) if isinstance(order, dict) else str(order)[:200]
+            put["order_status"] = "failed"
+            put["order_error"]  = msg
+            print(f"Put order failed for {put['symbol']}: {msg}")
+
+    except Exception:
+        put["order_status"] = "failed"
+        put["order_error"]  = traceback.format_exc()[-200:]
+
+    return put
 
 
 # ── Alpaca Trading ────────────────────────────────────────────────────────────
@@ -238,11 +306,15 @@ def cancel_all_orders():
 def execute_signal(sig: dict) -> dict:
     """
     Places a bracket order for a BUY signal:
-      - Market buy
+      - Market buy entry
       - Stop loss at invalidation level
       - Take profit limit at TP2
 
-    Also looks up a protective put near the stop price.
+    Then automatically places a protective put:
+      - Finds nearest put strike at/below stop, expiry 21-60 days
+      - Contracts = floor(shares / 100)
+      - If shares < 100, put is skipped (can't cover partial lot)
+      - Put order failure never blocks the stock trade confirmation
     """
     ticker = sig["ticker"]
     shares = sig["shares"]
@@ -250,15 +322,16 @@ def execute_signal(sig: dict) -> dict:
     tp2    = round(sig["tp2"], 2)
 
     result = {
-        "ticker":          ticker,
-        "shares":          shares,
-        "entry":           sig["price"],
-        "stop":            stop,
-        "tp2":             tp2,
-        "orders":          [],
-        "success":         False,
-        "error":           None,
-        "protective_put":  None,   # ← will be filled after order
+        "ticker":         ticker,
+        "shares":         shares,
+        "entry":          sig["price"],
+        "stop":           stop,
+        "tp2":            tp2,
+        "orders":         [],
+        "success":        False,
+        "error":          None,
+        "protective_put": None,
+        "put_contracts":  0,
     }
 
     # Check if already in position
@@ -277,6 +350,7 @@ def execute_signal(sig: dict) -> dict:
             return result
         result["shares"] = shares
 
+    # ── Place bracket order for the stock ──
     try:
         order = requests.post(
             f"{PAPER_URL}/orders",
@@ -304,15 +378,35 @@ def execute_signal(sig: dict) -> dict:
         result["orders"].append({"type": "BRACKET", "id": order["id"]})
         result["success"] = True
 
-        # ── Protective put lookup (non-blocking — won't fail the trade) ──
-        try:
-            put = get_protective_put(ticker, stop, sig["price"])
-            result["protective_put"] = put
-        except Exception:
-            result["protective_put"] = None  # silent fail — trade still confirmed
-
     except Exception:
         result["error"] = traceback.format_exc()[-300:]
+        return result
+
+    # ── Protective put: lookup then place order ──
+    try:
+        put = get_protective_put(ticker, stop, sig["price"])
+
+        if put is not None:
+            contracts = shares // 100  # 1 contract per 100 shares
+            result["put_contracts"] = contracts
+
+            if contracts >= 1:
+                put = execute_put_order(put, contracts)
+                result["orders"].append({
+                    "type":   "PUT",
+                    "symbol": put["symbol"],
+                    "qty":    contracts,
+                    "status": put.get("order_status", "unknown"),
+                    "id":     put.get("order_id", ""),
+                })
+            else:
+                put["order_status"] = "skipped"
+
+        result["protective_put"] = put
+
+    except Exception:
+        print(f"Put order error for {ticker}: {traceback.format_exc()[-200:]}")
+        result["protective_put"] = None
 
     return result
 
@@ -344,8 +438,14 @@ def format_execution_result(result: dict, sig: dict) -> str:
         f"{'='*36}",
     ]
 
-    # Append protective put block
-    put_block = format_put_block(result.get("protective_put"), result["stop"], result["ticker"])
+    # Append protective put block — pass contracts count for proper status display
+    put_contracts = result.get("put_contracts", 0)
+    put_block     = format_put_block(
+        result.get("protective_put"),
+        result["stop"],
+        result["ticker"],
+        contracts=put_contracts,
+    )
     lines.append(put_block)
 
     return "\n".join(lines)
