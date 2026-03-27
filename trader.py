@@ -18,7 +18,7 @@ Protective Put (auto-placed alongside every BUY):
   - If options are unavailable for the ticker, reports cleanly — stock trade unaffected
 
 Telegram commands:
-  /portfolio - open positions + P&L
+  /portfolio - open positions + P&L (day, 1W, 1M, all-time)
   /trades    - recent trade history
   /cancel    - cancel all open orders
 """
@@ -26,7 +26,7 @@ Telegram commands:
 import os
 import requests
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 ALPACA_KEY    = os.getenv("ALPACA_KEY", "")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET", "")
@@ -451,6 +451,48 @@ def format_execution_result(result: dict, sig: dict) -> str:
     return "\n".join(lines)
 
 
+# ── Portfolio History Gains ───────────────────────────────────────────────────
+
+def _fetch_portfolio_history(period: str, timeframe: str) -> list[float]:
+    """
+    Fetches equity curve from Alpaca portfolio history endpoint.
+    Returns a list of non-zero equity floats, or [] on error.
+    """
+    try:
+        url    = f"{PAPER_URL}/account/portfolio/history"
+        params = {"period": period, "timeframe": timeframe, "extended_hours": False}
+        r      = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        if not r.ok:
+            print(f"Portfolio history error [{period}]: {r.status_code} {r.text[:200]}")
+            return []
+        data   = r.json()
+        equity = data.get("equity", [])
+        return [float(e) for e in equity if e and float(e) > 0]
+    except Exception:
+        print(f"Portfolio history exception [{period}]: {traceback.format_exc()[-200:]}")
+        return []
+
+
+def _calc_gain(equity_list: list[float]) -> tuple[float, float] | tuple[None, None]:
+    """Returns (absolute_gain, pct_gain) or (None, None) if not enough data."""
+    if len(equity_list) < 2:
+        return None, None
+    start = equity_list[0]
+    end   = equity_list[-1]
+    gain  = end - start
+    pct   = (gain / start * 100) if start else 0.0
+    return gain, pct
+
+
+def _fmt_gain_line(label: str, gain: float | None, pct: float | None) -> str:
+    """Formats a single gain line with emoji."""
+    if gain is None:
+        return f"{label}: N/A"
+    arrow = "🟢" if gain >= 0 else "🔴"
+    sign  = "+" if gain >= 0 else ""
+    return f"{label}: {arrow} {sign}${gain:,.2f} ({sign}{pct:.2f}%)"
+
+
 # ── Portfolio & History ───────────────────────────────────────────────────────
 
 def format_portfolio() -> str:
@@ -463,15 +505,33 @@ def format_portfolio() -> str:
     pl_day  = equity - last_eq
     pl_pct  = pl_day / last_eq * 100 if last_eq > 0 else 0
 
+    # ── Fetch gain windows ────────────────────────────────────────────────────
+    week_equity    = _fetch_portfolio_history("1W", "1D")
+    month_equity   = _fetch_portfolio_history("1M", "1D")
+    alltime_equity = _fetch_portfolio_history("all", "1D")
+
+    week_gain,    week_pct    = _calc_gain(week_equity)
+    month_gain,   month_pct   = _calc_gain(month_equity)
+    alltime_gain, alltime_pct = _calc_gain(alltime_equity)
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
     lines = [
         f"{'='*36}",
         f"PAPER PORTFOLIO",
         f"{'='*36}",
+        f"Updated:   {now}",
+        f"",
         f"Equity:    ${equity:,.2f}",
         f"Cash:      ${cash:,.2f}",
-        f"Day P&L:   ${pl_day:+,.2f} ({pl_pct:+.2f}%)",
-        f"Positions: {len(positions)}",
+        f"",
+        f"── Performance ──────────────────────",
+        _fmt_gain_line("Day   ", pl_day, pl_pct),
+        _fmt_gain_line("1-Week", week_gain, week_pct),
+        _fmt_gain_line("1-Month", month_gain, month_pct),
+        _fmt_gain_line("All-Time", alltime_gain, alltime_pct),
         f"{'='*36}",
+        f"Positions: {len(positions)}",
     ]
 
     if not positions:
