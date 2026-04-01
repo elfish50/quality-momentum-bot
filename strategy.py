@@ -2,6 +2,17 @@
 ELLIOTT WAVE + FIBONACCI STRATEGY
 Based on Asaf Naamani's framework
 
+PATCH v2 changes vs prior version:
+  1. weekly_trend_is_up() — softened to allow trading during corrections:
+     - Now passes if SMA10w > SMA20w (uptrend) OR if SMA10w is recovering
+       (rising for 2+ consecutive weeks after a dip) — catches early reversals
+     - Added override: if price is ABOVE SMA200 daily, weekly filter is relaxed
+       (strong long-term bull stocks can set up during weekly corrections)
+  2. Wave 2 RSI window widened: 25-65 (was 25-60) — catches more setups
+  3. Wave 4 RSI window widened: 30-70 (was 35-65)
+  4. MIN_WAVE1_MOVE lowered: 0.05 (was 0.07) — catches smaller but valid waves
+  5. VOL_CONFIRM_RATIO lowered: 1.2x (was 1.5x) — less strict in low-vol markets
+
 Entry Scenarios (LONG ONLY):
   1. Wave 2 pullback: price retraces 50-78.6% of Wave 1 -> buy reversal zone
   2. Wave 4 pullback: price retraces 38.2% of Wave 3 -> buy shallow correction
@@ -16,27 +27,6 @@ Targets:
   TP1: 1.272x Fibonacci extension of Wave 1
   TP2: 1.618x Fibonacci extension of Wave 1
   TP3: 2.618x Fibonacci extension (stretch)
-
-Filters:
-  - Weekly trend filter: SMA10w must be above SMA20w (weekly uptrend required)
-  - Volume uses PREVIOUS completed bar (not live partial intraday bar)
-  - Volume threshold: 1.5x average
-  - Quality score threshold: 40
-  - Wave 2 reversal zone: 50-78.6%
-  - Swing point detection: iloc-based, no fragile index matching
-  - ABC targets: extensions beyond Wave A start
-  - SIP feed fallback when IEX returns insufficient bars
-
-KEY FIX vs prior version:
-  vol_confirmed now checks df.iloc[-2] (yesterday's confirmed bar) instead of
-  df.iloc[-1] (today's live partial bar). Scans run intraday (10AM/12:30/2:30 ET)
-  so the current bar is never fully formed. Comparing partial intraday volume
-  against a 20-day average of FULL daily bars almost never crosses 1.5x,
-  suppressing all BUY signals to WATCH. Using the previous completed bar fixes this.
-
-Timeframe: Daily bars + weekly trend confirmation
-Quality: Berkshire screen (ROE, margins, EPS, D/E)
-Account: $1,000 | Risk: 10% = $100 per trade
 """
 
 import os
@@ -68,11 +58,11 @@ EXT_1272 = 1.272
 EXT_1618 = 1.618
 EXT_2618 = 2.618
 
-# Thresholds
-VOL_CONFIRM_RATIO = 1.5   # require meaningful volume surge on confirmed (previous) bar
-MIN_QUALITY_SCORE = 40    # strict quality gate
-MIN_WAVE1_MOVE    = 0.07  # wave 1 must be at least 7% move
-MIN_RR_TP2        = 2.0   # minimum R:R to TP2
+# Thresholds — PATCHED (less strict for choppy/correcting markets)
+VOL_CONFIRM_RATIO = 1.2   # was 1.5 — lowered to catch valid setups in low-vol markets
+MIN_QUALITY_SCORE = 40
+MIN_WAVE1_MOVE    = 0.05  # was 0.07 — lowered to catch smaller valid waves
+MIN_RR_TP2        = 2.0
 
 
 # ── Price Data ────────────────────────────────────────────────────────────────
@@ -94,7 +84,7 @@ def get_price_data(ticker):
                 "timeframe":  "1Day",
                 "limit":      400,
                 "feed":       feed,
-                "adjustment": "split",   # split-adjusted prices
+                "adjustment": "split",
             }
             r    = requests.get(
                 f"{ALPACA_URL}/stocks/{ticker}/bars",
@@ -121,10 +111,6 @@ def get_price_data(ticker):
 
 
 def get_weekly_bars(df):
-    """
-    Resample daily bars to weekly for trend filter.
-    Returns weekly DataFrame with Open/High/Low/Close/Volume.
-    """
     df2 = df.copy()
     df2["Date"] = pd.to_datetime(df2["Date"])
     df2 = df2.set_index("Date")
@@ -140,20 +126,52 @@ def get_weekly_bars(df):
 
 def weekly_trend_is_up(df):
     """
-    Weekly trend filter: SMA10w > SMA20w (weekly uptrend required).
-    Prevents buying Wave 2 pullbacks in a weekly downtrend.
-    Returns True if trend is up or insufficient data (gives benefit of doubt).
+    PATCHED weekly trend filter — 3 ways to pass (was 1):
+
+    1. Classic uptrend: SMA10w > SMA20w AND SMA10w rising (original)
+    2. Early recovery: SMA10w was below SMA20w but has been rising for 2+ weeks
+       — catches the beginning of trend reversals during corrections
+    3. Price above daily SMA200: strong long-term bull stock — relax weekly
+       filter since pullbacks in bull stocks are buyable even during weekly dips
+
+    This prevents the scanner from going completely silent for weeks after
+    a market correction while still blocking genuine bear markets.
     """
     try:
+        # Check daily SMA200 first — if price > SMA200, relax weekly filter
+        closes_daily = df["Close"]
+        sma200_daily = closes_daily.rolling(200).mean().iloc[-1]
+        price_daily  = float(closes_daily.iloc[-1])
+        above_sma200 = not pd.isna(sma200_daily) and price_daily > float(sma200_daily)
+
         weekly = get_weekly_bars(df)
         if len(weekly) < 22:
-            return True  # not enough weekly bars — don't reject
+            return True
+
         close    = weekly["Close"]
-        sma10w   = close.rolling(10).mean().iloc[-1]
-        sma20w   = close.rolling(20).mean().iloc[-1]
-        sma10w_1 = close.rolling(10).mean().iloc[-2]
-        # Uptrend: SMA10w > SMA20w AND SMA10w is rising
-        return sma10w > sma20w and sma10w > sma10w_1
+        sma10w   = close.rolling(10).mean()
+        sma20w   = close.rolling(20).mean()
+
+        cur_10   = float(sma10w.iloc[-1])
+        cur_20   = float(sma20w.iloc[-1])
+        prev_10  = float(sma10w.iloc[-2])
+        prev2_10 = float(sma10w.iloc[-3])
+
+        # 1. Classic uptrend
+        if cur_10 > cur_20 and cur_10 > prev_10:
+            return True
+
+        # 2. Early recovery — SMA10w rising for 2 consecutive weeks
+        sma10_recovering = cur_10 > prev_10 > prev2_10
+        if sma10_recovering:
+            return True
+
+        # 3. Price above daily SMA200 — long-term bull, allow weekly pullback
+        if above_sma200:
+            return True
+
+        return False
+
     except Exception:
         return True  # don't reject on error
 
@@ -226,7 +244,6 @@ def compute_indicators(df):
     df = df.copy()
     close = df["Close"]
 
-    # RSI 14 (Wilder's smoothing)
     delta    = close.diff()
     gain     = delta.clip(lower=0)
     loss     = (-delta).clip(lower=0)
@@ -235,7 +252,6 @@ def compute_indicators(df):
     rs       = avg_gain / avg_loss.replace(0, float("nan"))
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # ATR 14
     high, low = df["High"], df["Low"]
     tr = pd.concat([
         high - low,
@@ -244,22 +260,15 @@ def compute_indicators(df):
     ], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(14).mean()
 
-    # Moving averages
     df["SMA50"]  = close.rolling(50).mean()
     df["SMA200"] = close.rolling(200).mean()
     df["EMA21"]  = close.ewm(span=21, adjust=False).mean()
-
-    # Volume average (20-day, based on ALL bars including current)
     df["VolAvg20"] = df["Volume"].rolling(20).mean()
 
     return df
 
 
 def find_swing_points(df, lookback=90, min_bars=5):
-    """
-    Find significant swing highs/lows using iloc (no fragile index matching).
-    Returns lists of (iloc_position, price) tuples.
-    """
     n      = len(df)
     start  = max(0, n - lookback)
     highs  = []
@@ -282,22 +291,13 @@ def find_swing_points(df, lookback=90, min_bars=5):
 
 def _vol_confirmed(df) -> tuple[bool, float]:
     """
-    KEY FIX: Use the PREVIOUS completed daily bar (iloc[-2]) for volume confirmation.
-
-    Scans run at 10AM, 12:30PM, 2:30PM ET while market is open.
-    The current bar (iloc[-1]) is partially formed — its volume is a fraction
-    of what it will be by close. Comparing partial intraday volume against a
-    20-day average of FULL bars produces a ratio well below 1.5x even on
-    high-volume days, so vol_confirmed was almost always False → WATCH, never BUY.
-
-    Using iloc[-2] (yesterday's completed bar) gives accurate volume confirmation.
-    The 20-day average (VolAvg20) at iloc[-2] is also computed from completed bars,
-    so the comparison is apples-to-apples.
+    Uses previous completed daily bar (iloc[-2]) for volume confirmation.
+    PATCHED: threshold lowered to 1.2x (was 1.5x).
     """
     if len(df) < 3:
         return False, 0.0
-    prev_bar = df.iloc[-2]
-    vol_avg  = float(prev_bar["VolAvg20"]) if prev_bar["VolAvg20"] > 0 else 1.0
+    prev_bar  = df.iloc[-2]
+    vol_avg   = float(prev_bar["VolAvg20"]) if prev_bar["VolAvg20"] > 0 else 1.0
     vol_ratio = float(prev_bar["Volume"]) / vol_avg
     return vol_ratio >= VOL_CONFIRM_RATIO, round(vol_ratio, 2)
 
@@ -306,13 +306,7 @@ def _vol_confirmed(df) -> tuple[bool, float]:
 
 def detect_wave2_setup(df):
     """
-    Wave 2 pullback:
-    - Wave 1: swing low -> swing high (at least MIN_WAVE1_MOVE)
-    - Price retraces 50–78.6% of Wave 1 (wider zone)
-    - Weekly trend must be up
-    - RSI turning up from 25–60, confirmed rising
-    - Volume check on previous completed bar (see _vol_confirmed)
-    - R:R to TP2 >= 2.0
+    PATCHED: RSI window widened to 25-65 (was 25-60).
     """
     if not weekly_trend_is_up(df):
         return None
@@ -358,7 +352,7 @@ def detect_wave2_setup(df):
 
     rsi_prev   = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
     rsi_rising = rsi > rsi_prev
-    rsi_ok     = 25 <= rsi <= 60
+    rsi_ok     = 25 <= rsi <= 65  # PATCHED: was 60
 
     if not (rsi_rising and rsi_ok):
         return None
@@ -366,7 +360,6 @@ def detect_wave2_setup(df):
     if price < float(df.iloc[-4:-1]["Low"].min()) * 1.002:
         return None
 
-    # FIX: use previous completed bar for volume
     vol_confirmed, vol_ratio = _vol_confirmed(df)
 
     stop = round(wave1_origin * 0.99, 2)
@@ -430,12 +423,7 @@ def detect_wave2_setup(df):
 
 def detect_wave4_setup(df):
     """
-    Wave 4 pullback:
-    - Need at least: low1 (W1 origin) -> high1 (W1 top) -> high2 (W3 top)
-    - Price retraces 38.2% of Wave 3
-    - Wave 4 cannot overlap Wave 1 territory (Elliott rule)
-    - Weekly trend must be up
-    - RSI 35–65, rising
+    PATCHED: RSI window widened to 30-70 (was 35-65).
     """
     if not weekly_trend_is_up(df):
         return None
@@ -472,12 +460,11 @@ def detect_wave4_setup(df):
 
     rsi_prev   = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
     rsi_rising = rsi > rsi_prev
-    rsi_ok     = 35 <= rsi <= 65
+    rsi_ok     = 30 <= rsi <= 70  # PATCHED: was 35-65
 
     if not (rsi_rising and rsi_ok):
         return None
 
-    # FIX: use previous completed bar for volume
     vol_confirmed, vol_ratio = _vol_confirmed(df)
 
     stop = round(wave1_high * 0.99, 2)
@@ -537,15 +524,7 @@ def detect_wave4_setup(df):
 # ── ABC Setup ─────────────────────────────────────────────────────────────────
 
 def detect_abc_setup(df):
-    """
-    ABC Correction:
-    - Wave A: impulse drop (high -> low)
-    - Wave B: partial bounce
-    - Wave C: second drop, ends near or below Wave A low
-    - Entry at Wave C completion reversal
-    - Stop: 1% below Wave A low
-    - Targets extend BEYOND Wave A start (TP1 = recovery, TP2/TP3 = extension)
-    """
+    """Unchanged from original — ABC already works well in corrections."""
     if not weekly_trend_is_up(df):
         return None
 
@@ -586,7 +565,6 @@ def detect_abc_setup(df):
     if not (rsi_rising and rsi_ok):
         return None
 
-    # FIX: use previous completed bar for volume
     vol_confirmed, vol_ratio = _vol_confirmed(df)
 
     stop = round(wave_a_end * 0.99, 2)
@@ -662,12 +640,10 @@ def position_size(price, stop):
 
 def analyze_ticker(ticker):
     try:
-        # 1. Price data (IEX -> SIP fallback)
         df = get_price_data(ticker)
         if df is None or len(df) < 60:
             return None
 
-        # 2. Try all three Elliott Wave setups
         setup = (
             detect_wave2_setup(df) or
             detect_wave4_setup(df) or
@@ -677,7 +653,6 @@ def analyze_ticker(ticker):
         if setup is None:
             return None
 
-        # 3. Fundamentals + quality screen
         fund = get_fundamentals(ticker)
         if not fund:
             return None
@@ -687,12 +662,10 @@ def analyze_ticker(ticker):
             print(f"[{ticker}] SKIP | Quality {q_score:.0f} < {MIN_QUALITY_SCORE}")
             return None
 
-        # 4. Position sizing
         price  = setup["price"]
         stop   = setup["stop"]
         sizing = position_size(price, stop)
 
-        # 5. Signal score
         score = 0.0
         score += q_score * 0.35
         rsi    = setup["rsi"]
@@ -706,11 +679,8 @@ def analyze_ticker(ticker):
         elif rr >= 2.0: score += 12
         else:           score += 5
 
-        # 6. Signal type — vol_confirmed uses previous completed bar (see _vol_confirmed)
         signal_type = "BUY" if setup.get("vol_confirmed", False) else "WATCH"
-
-        # 7. Hold time
-        hold_time = "POSITION (3-8 weeks)" if score >= 70 else "SWING (1-3 weeks)"
+        hold_time   = "POSITION (3-8 weeks)" if score >= 70 else "SWING (1-3 weeks)"
 
         print(
             f"[{ticker}] {signal_type} | {setup['setup']} | "
