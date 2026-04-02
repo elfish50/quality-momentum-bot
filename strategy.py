@@ -2,16 +2,20 @@
 ELLIOTT WAVE + FIBONACCI STRATEGY
 Based on Asaf Naamani's framework
 
-PATCH v2 changes vs prior version:
-  1. weekly_trend_is_up() — softened to allow trading during corrections:
-     - Now passes if SMA10w > SMA20w (uptrend) OR if SMA10w is recovering
-       (rising for 2+ consecutive weeks after a dip) — catches early reversals
-     - Added override: if price is ABOVE SMA200 daily, weekly filter is relaxed
-       (strong long-term bull stocks can set up during weekly corrections)
-  2. Wave 2 RSI window widened: 25-65 (was 25-60) — catches more setups
-  3. Wave 4 RSI window widened: 30-70 (was 35-65)
-  4. MIN_WAVE1_MOVE lowered: 0.05 (was 0.07) — catches smaller but valid waves
-  5. VOL_CONFIRM_RATIO lowered: 1.2x (was 1.5x) — less strict in low-vol markets
+PATCH v3 changes vs v2:
+  1. Deduplication: seen_setups.json tracks alerted tickers by setup+price band.
+     - Suppresses re-alerts if price hasn't moved >2% from first alert price.
+     - Entries auto-expire after SEEN_EXPIRY_DAYS (default 10 days).
+  2. Swing recency filter: find_swing_points() now accepts max_age_bars (default 20).
+     - Only swing highs/lows formed within the last 20 bars qualify.
+     - Prevents the scanner from re-firing on stale, weeks-old swing points.
+  3. weekly_trend_is_up() — softened to allow trading during corrections (from v2):
+     - Passes if SMA10w > SMA20w (uptrend) OR SMA10w is recovering (2+ weeks rising).
+     - Override: if price is ABOVE SMA200 daily, weekly filter is relaxed.
+  4. Wave 2 RSI window widened: 25-65 (was 25-60 in v1).
+  5. Wave 4 RSI window widened: 30-70 (was 35-65 in v1).
+  6. MIN_WAVE1_MOVE lowered: 0.05 (was 0.07 in v1).
+  7. VOL_CONFIRM_RATIO lowered: 1.2x (was 1.5x in v1).
 
 Entry Scenarios (LONG ONLY):
   1. Wave 2 pullback: price retraces 50-78.6% of Wave 1 -> buy reversal zone
@@ -30,7 +34,9 @@ Targets:
 """
 
 import os
+import json
 import math
+import pathlib
 import traceback
 import pandas as pd
 import numpy as np
@@ -58,11 +64,54 @@ EXT_1272 = 1.272
 EXT_1618 = 1.618
 EXT_2618 = 2.618
 
-# Thresholds — PATCHED (less strict for choppy/correcting markets)
-VOL_CONFIRM_RATIO = 1.2   # was 1.5 — lowered to catch valid setups in low-vol markets
+# Thresholds
+VOL_CONFIRM_RATIO = 1.2   # lowered from 1.5 in v2
 MIN_QUALITY_SCORE = 40
-MIN_WAVE1_MOVE    = 0.05  # was 0.07 — lowered to catch smaller valid waves
+MIN_WAVE1_MOVE    = 0.05  # lowered from 0.07 in v2
 MIN_RR_TP2        = 2.0
+
+# ── Deduplication (v3) ────────────────────────────────────────────────────────
+
+SEEN_FILE        = pathlib.Path("seen_setups.json")
+SEEN_EXPIRY_DAYS = 10    # how many days before a seen entry expires
+PRICE_TOLERANCE  = 0.02  # suppress re-alert if price within 2% of first alert
+
+
+def load_seen() -> dict:
+    """Load seen setups, dropping entries older than SEEN_EXPIRY_DAYS."""
+    if not SEEN_FILE.exists():
+        return {}
+    try:
+        seen    = json.loads(SEEN_FILE.read_text())
+        cutoff  = datetime.now() - timedelta(days=SEEN_EXPIRY_DAYS)
+        active  = {
+            k: v for k, v in seen.items()
+            if datetime.fromisoformat(v["ts"]) > cutoff
+        }
+        return active
+    except Exception:
+        return {}
+
+
+def save_seen(seen: dict) -> None:
+    SEEN_FILE.write_text(json.dumps(seen, indent=2))
+
+
+def already_alerted(ticker: str, setup_name: str, price: float, seen: dict) -> bool:
+    """
+    Returns True if this ticker+setup was already alerted at a price
+    within PRICE_TOLERANCE of the current price.
+    """
+    key = f"{ticker}::{setup_name}"
+    if key not in seen:
+        return False
+    prev_price = seen[key]["price"]
+    return abs(price - prev_price) / prev_price < PRICE_TOLERANCE
+
+
+def mark_seen(ticker: str, setup_name: str, price: float, seen: dict) -> None:
+    key = f"{ticker}::{setup_name}"
+    seen[key] = {"price": price, "ts": datetime.now().isoformat()}
 
 
 # ── Price Data ────────────────────────────────────────────────────────────────
@@ -126,19 +175,13 @@ def get_weekly_bars(df):
 
 def weekly_trend_is_up(df):
     """
-    PATCHED weekly trend filter — 3 ways to pass (was 1):
+    PATCHED weekly trend filter (v2) — 3 ways to pass:
 
-    1. Classic uptrend: SMA10w > SMA20w AND SMA10w rising (original)
-    2. Early recovery: SMA10w was below SMA20w but has been rising for 2+ weeks
-       — catches the beginning of trend reversals during corrections
-    3. Price above daily SMA200: strong long-term bull stock — relax weekly
-       filter since pullbacks in bull stocks are buyable even during weekly dips
-
-    This prevents the scanner from going completely silent for weeks after
-    a market correction while still blocking genuine bear markets.
+    1. Classic uptrend: SMA10w > SMA20w AND SMA10w rising.
+    2. Early recovery: SMA10w rising for 2+ consecutive weeks after a dip.
+    3. Price above daily SMA200: long-term bull — relax weekly filter.
     """
     try:
-        # Check daily SMA200 first — if price > SMA200, relax weekly filter
         closes_daily = df["Close"]
         sma200_daily = closes_daily.rolling(200).mean().iloc[-1]
         price_daily  = float(closes_daily.iloc[-1])
@@ -162,8 +205,7 @@ def weekly_trend_is_up(df):
             return True
 
         # 2. Early recovery — SMA10w rising for 2 consecutive weeks
-        sma10_recovering = cur_10 > prev_10 > prev2_10
-        if sma10_recovering:
+        if cur_10 > prev_10 > prev2_10:
             return True
 
         # 3. Price above daily SMA200 — long-term bull, allow weekly pullback
@@ -260,21 +302,31 @@ def compute_indicators(df):
     ], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(14).mean()
 
-    df["SMA50"]  = close.rolling(50).mean()
-    df["SMA200"] = close.rolling(200).mean()
-    df["EMA21"]  = close.ewm(span=21, adjust=False).mean()
+    df["SMA50"]    = close.rolling(50).mean()
+    df["SMA200"]   = close.rolling(200).mean()
+    df["EMA21"]    = close.ewm(span=21, adjust=False).mean()
     df["VolAvg20"] = df["Volume"].rolling(20).mean()
 
     return df
 
 
-def find_swing_points(df, lookback=90, min_bars=5):
+def find_swing_points(df, lookback=90, min_bars=5, max_age_bars=20):
+    """
+    PATCHED (v3): Added max_age_bars filter.
+    Only swing highs/lows formed within the last max_age_bars bars qualify.
+    This prevents the scanner from re-firing on the same stale swing points
+    every single run for weeks on end.
+    """
     n      = len(df)
     start  = max(0, n - lookback)
     highs  = []
     lows   = []
 
     for i in range(start + min_bars, n - min_bars):
+        # Skip swings older than max_age_bars from the current bar
+        if i < n - max_age_bars:
+            continue
+
         window = df.iloc[i - min_bars: i + min_bars + 1]
         bar    = df.iloc[i]
 
@@ -292,7 +344,7 @@ def find_swing_points(df, lookback=90, min_bars=5):
 def _vol_confirmed(df) -> tuple[bool, float]:
     """
     Uses previous completed daily bar (iloc[-2]) for volume confirmation.
-    PATCHED: threshold lowered to 1.2x (was 1.5x).
+    Threshold: 1.2x avg volume (lowered from 1.5x in v2).
     """
     if len(df) < 3:
         return False, 0.0
@@ -305,9 +357,7 @@ def _vol_confirmed(df) -> tuple[bool, float]:
 # ── Wave 2 Setup ──────────────────────────────────────────────────────────────
 
 def detect_wave2_setup(df):
-    """
-    PATCHED: RSI window widened to 25-65 (was 25-60).
-    """
+    """RSI window: 25-65 (widened from 25-60 in v2)."""
     if not weekly_trend_is_up(df):
         return None
 
@@ -316,7 +366,7 @@ def detect_wave2_setup(df):
     price   = float(current["Close"])
     rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
 
-    highs, lows = find_swing_points(df, lookback=90, min_bars=5)
+    highs, lows = find_swing_points(df, lookback=90, min_bars=5, max_age_bars=20)
 
     if len(highs) < 1 or len(lows) < 1:
         return None
@@ -352,7 +402,7 @@ def detect_wave2_setup(df):
 
     rsi_prev   = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
     rsi_rising = rsi > rsi_prev
-    rsi_ok     = 25 <= rsi <= 65  # PATCHED: was 60
+    rsi_ok     = 25 <= rsi <= 65
 
     if not (rsi_rising and rsi_ok):
         return None
@@ -422,9 +472,7 @@ def detect_wave2_setup(df):
 # ── Wave 4 Setup ──────────────────────────────────────────────────────────────
 
 def detect_wave4_setup(df):
-    """
-    PATCHED: RSI window widened to 30-70 (was 35-65).
-    """
+    """RSI window: 30-70 (widened from 35-65 in v2)."""
     if not weekly_trend_is_up(df):
         return None
 
@@ -433,7 +481,7 @@ def detect_wave4_setup(df):
     price   = float(current["Close"])
     rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
 
-    highs, lows = find_swing_points(df, lookback=120, min_bars=5)
+    highs, lows = find_swing_points(df, lookback=120, min_bars=5, max_age_bars=20)
 
     if len(highs) < 2 or len(lows) < 1:
         return None
@@ -460,7 +508,7 @@ def detect_wave4_setup(df):
 
     rsi_prev   = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
     rsi_rising = rsi > rsi_prev
-    rsi_ok     = 30 <= rsi <= 70  # PATCHED: was 35-65
+    rsi_ok     = 30 <= rsi <= 70
 
     if not (rsi_rising and rsi_ok):
         return None
@@ -524,7 +572,7 @@ def detect_wave4_setup(df):
 # ── ABC Setup ─────────────────────────────────────────────────────────────────
 
 def detect_abc_setup(df):
-    """Unchanged from original — ABC already works well in corrections."""
+    """Unchanged logic — ABC already works well in corrections."""
     if not weekly_trend_is_up(df):
         return None
 
@@ -533,7 +581,7 @@ def detect_abc_setup(df):
     price   = float(current["Close"])
     rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
 
-    highs, lows = find_swing_points(df, lookback=90, min_bars=4)
+    highs, lows = find_swing_points(df, lookback=90, min_bars=4, max_age_bars=20)
 
     if len(highs) < 1 or len(lows) < 2:
         return None
@@ -638,7 +686,20 @@ def position_size(price, stop):
 
 # ── Main Analyzer ─────────────────────────────────────────────────────────────
 
-def analyze_ticker(ticker):
+def analyze_ticker(ticker, seen: dict | None = None):
+    """
+    Analyze a single ticker. Pass the shared `seen` dict from load_seen()
+    so deduplication works across the whole scanner run without re-reading
+    the file on every ticker.
+
+    Example usage in your scanner loop:
+        seen = load_seen()
+        results = [analyze_ticker(t, seen) for t in TICKERS]
+        save_seen(seen)
+    """
+    if seen is None:
+        seen = load_seen()
+
     try:
         df = get_price_data(ticker)
         if df is None or len(df) < 60:
@@ -653,6 +714,16 @@ def analyze_ticker(ticker):
         if setup is None:
             return None
 
+        price      = setup["price"]
+        setup_name = setup["setup"]
+
+        # ── Deduplication check (v3) ──────────────────────────────────────────
+        if already_alerted(ticker, setup_name, price, seen):
+            print(f"[{ticker}] SKIP — already alerted '{setup_name}' at similar price")
+            return None
+        mark_seen(ticker, setup_name, price, seen)
+        # (caller must call save_seen(seen) after the full scan loop)
+
         fund = get_fundamentals(ticker)
         if not fund:
             return None
@@ -662,7 +733,6 @@ def analyze_ticker(ticker):
             print(f"[{ticker}] SKIP | Quality {q_score:.0f} < {MIN_QUALITY_SCORE}")
             return None
 
-        price  = setup["price"]
         stop   = setup["stop"]
         sizing = position_size(price, stop)
 
@@ -683,16 +753,16 @@ def analyze_ticker(ticker):
         hold_time   = "POSITION (3-8 weeks)" if score >= 70 else "SWING (1-3 weeks)"
 
         print(
-            f"[{ticker}] {signal_type} | {setup['setup']} | "
+            f"[{ticker}] {signal_type} | {setup_name} | "
             f"Score {score:.0f} | RSI {rsi:.0f} | "
-            f"R:R TP2 {setup.get('rr_tp2',0):.1f}x | "
-            f"Vol {setup.get('vol_ratio',0):.1f}x (prev bar)"
+            f"R:R TP2 {setup.get('rr_tp2', 0):.1f}x | "
+            f"Vol {setup.get('vol_ratio', 0):.1f}x (prev bar)"
         )
 
         return {
             "ticker":        ticker,
             "signal":        signal_type,
-            "setup":         setup["setup"],
+            "setup":         setup_name,
             "hold_time":     hold_time,
             "signal_score":  round(score, 1),
             "quality_score": q_score,
@@ -728,3 +798,17 @@ def analyze_ticker(ticker):
     except Exception:
         print(f"[{ticker}] ERROR: {traceback.format_exc()[-300:]}")
         return None
+
+
+# ── Scanner loop example ──────────────────────────────────────────────────────
+# Replace TICKERS with your actual watchlist.
+#
+# TICKERS = ["AAPL", "MSFT", "NVDA", ...]
+#
+# if __name__ == "__main__":
+#     seen    = load_seen()
+#     results = [r for t in TICKERS if (r := analyze_ticker(t, seen)) is not None]
+#     save_seen(seen)
+#     results.sort(key=lambda x: x["signal_score"], reverse=True)
+#     for r in results:
+#         print(r)
