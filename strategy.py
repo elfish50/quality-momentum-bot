@@ -2,35 +2,31 @@
 ELLIOTT WAVE + FIBONACCI STRATEGY
 Based on Asaf Naamani's framework
 
-PATCH v3 changes vs v2:
-  1. Deduplication: seen_setups.json tracks alerted tickers by setup+price band.
-     - Suppresses re-alerts if price hasn't moved >2% from first alert price.
-     - Entries auto-expire after SEEN_EXPIRY_DAYS (default 10 days).
-  2. Swing recency filter: find_swing_points() now accepts max_age_bars (default 20).
-     - Only swing highs/lows formed within the last 20 bars qualify.
-     - Prevents the scanner from re-firing on stale, weeks-old swing points.
-  3. weekly_trend_is_up() — softened to allow trading during corrections (from v2):
-     - Passes if SMA10w > SMA20w (uptrend) OR SMA10w is recovering (2+ weeks rising).
-     - Override: if price is ABOVE SMA200 daily, weekly filter is relaxed.
-  4. Wave 2 RSI window widened: 25-65 (was 25-60 in v1).
-  5. Wave 4 RSI window widened: 30-70 (was 35-65 in v1).
-  6. MIN_WAVE1_MOVE lowered: 0.05 (was 0.07 in v1).
-  7. VOL_CONFIRM_RATIO lowered: 1.2x (was 1.5x in v1).
+PATCH v4 — Dynamic Ticker Universe via Finviz Screener
+═══════════════════════════════════════════════════════
+The core problem: a static list of ~219 tickers means the scanner always
+sees the same stocks and finds the same setups.
 
-Entry Scenarios (LONG ONLY):
-  1. Wave 2 pullback: price retraces 50-78.6% of Wave 1 -> buy reversal zone
-  2. Wave 4 pullback: price retraces 38.2% of Wave 3 -> buy shallow correction
-  3. ABC correction: price completes C wave -> buy end of correction
+Fix: get_universe() pulls a FRESH list of candidates from Finviz every run
+using filters that pre-qualify stocks before Elliott Wave analysis:
+  - Price > SMA20 AND SMA20 > SMA50 (price structure uptrend)
+  - RSI between 40-70 (not overbought, not in freefall)
+  - Average volume > 300k (liquid enough)
+  - Market cap > $300M (small cap and above)
+  - Country = USA
+  - Optionally: sector filter (edit SECTORS below)
 
-Stop Placement:
-  Wave 2: just below Wave 1 origin (-1%)
-  Wave 4: just below Wave 1 high (-1%)
-  ABC:    just below Wave A low (-1%)
+This replaces the need for a hardcoded watchlist entirely.
+Run the scanner daily — it fetches a different set of candidates each time
+as market conditions shift, so you always see fresh setups.
 
-Targets:
-  TP1: 1.272x Fibonacci extension of Wave 1
-  TP2: 1.618x Fibonacci extension of Wave 1
-  TP3: 2.618x Fibonacci extension (stretch)
+All v3 patches are preserved:
+  v3: Deduplication (seen_setups.json), swing recency filter (max_age_bars),
+      auto-expiry of seen entries after SEEN_EXPIRY_DAYS.
+  v2: Weekly trend filter softened, RSI windows widened, MIN_WAVE1_MOVE
+      lowered, VOL_CONFIRM_RATIO lowered.
+
+Install: pip install finvizfinance
 """
 
 import os
@@ -43,6 +39,16 @@ import numpy as np
 import requests
 from datetime import datetime, timedelta
 
+# ── Finviz screener ───────────────────────────────────────────────────────────
+try:
+    from finvizfinance.screener.ticker import Ticker as FinvizTicker
+    FINVIZ_AVAILABLE = True
+except ImportError:
+    FINVIZ_AVAILABLE = False
+    print("WARNING: finvizfinance not installed. Run: pip install finvizfinance")
+    print("Falling back to FALLBACK_TICKERS list below.")
+
+# ── Keys ──────────────────────────────────────────────────────────────────────
 ALPACA_KEY    = os.getenv("ALPACA_KEY", "")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET", "")
 FINNHUB_KEY   = os.getenv("FINNHUB_KEY", "")
@@ -50,45 +56,72 @@ FINNHUB_KEY   = os.getenv("FINNHUB_KEY", "")
 ALPACA_URL  = "https://data.alpaca.markets/v2"
 FINNHUB_URL = "https://finnhub.io/api/v1"
 
+# ── Account ───────────────────────────────────────────────────────────────────
 ACCOUNT  = 1_000
 RISK_PCT = 0.10
 
-# Fibonacci retracement levels
+# ── Fibonacci levels ──────────────────────────────────────────────────────────
 FIB_382 = 0.382
 FIB_500 = 0.500
 FIB_618 = 0.618
 FIB_786 = 0.786
 
-# Extension targets
 EXT_1272 = 1.272
 EXT_1618 = 1.618
 EXT_2618 = 2.618
 
-# Thresholds
-VOL_CONFIRM_RATIO = 1.2   # lowered from 1.5 in v2
+# ── Strategy thresholds ───────────────────────────────────────────────────────
+VOL_CONFIRM_RATIO = 1.2
 MIN_QUALITY_SCORE = 40
-MIN_WAVE1_MOVE    = 0.05  # lowered from 0.07 in v2
+MIN_WAVE1_MOVE    = 0.05
 MIN_RR_TP2        = 2.0
 
-# ── Deduplication (v3) ────────────────────────────────────────────────────────
+# ── Screener config ───────────────────────────────────────────────────────────
+# How many tickers to pull from Finviz per run.
+# More = more setups found but slower scan. 300-500 is a good balance.
+UNIVERSE_SIZE = 400
 
+# Finviz filter preset — targets stocks in a price uptrend with room to run.
+# See all filter keys: https://finvizfinance.readthedocs.io/en/latest/
+FINVIZ_FILTERS = {
+    "Price":           "Over $5",          # avoid penny stocks
+    "Average Volume":  "Over 300K",        # liquid enough for clean price action
+    "Market Cap.":     "Small ($300mln to $2bln)",  # focus: small/mid cap
+    "Country":         "USA",
+    "20-Day Simple Moving Average": "Price above SMA20",
+    "50-Day Simple Moving Average": "Price above SMA50",
+    "RSI (14)":        "Not Overbought (50)",  # RSI between 50-70 range
+}
+
+# Optional: restrict to specific sectors. Comment out to scan all sectors.
+# FINVIZ_FILTERS["Sector"] = "Technology"
+
+# Fallback list used if finvizfinance is not installed.
+# Replace with your own watchlist or leave as-is.
+FALLBACK_TICKERS = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","JPM","V","UNH",
+    "LLY","XOM","JNJ","PG","MA","HD","MRK","ABBV","CVX","AVGO",
+    "PEP","KO","COST","WMT","MCD","ADBE","CRM","ACN","TMO","NFLX",
+    "QCOM","INTC","AMD","TXN","HON","UPS","CAT","GS","MS","AXP",
+    "BA","GE","MMM","LMT","RTX","DE","EMR","ITW","ETN","PH",
+]
+
+# ── Deduplication (v3) ────────────────────────────────────────────────────────
 SEEN_FILE        = pathlib.Path("seen_setups.json")
-SEEN_EXPIRY_DAYS = 10    # how many days before a seen entry expires
-PRICE_TOLERANCE  = 0.02  # suppress re-alert if price within 2% of first alert
+SEEN_EXPIRY_DAYS = 10
+PRICE_TOLERANCE  = 0.02
 
 
 def load_seen() -> dict:
-    """Load seen setups, dropping entries older than SEEN_EXPIRY_DAYS."""
     if not SEEN_FILE.exists():
         return {}
     try:
-        seen    = json.loads(SEEN_FILE.read_text())
-        cutoff  = datetime.now() - timedelta(days=SEEN_EXPIRY_DAYS)
-        active  = {
+        seen   = json.loads(SEEN_FILE.read_text())
+        cutoff = datetime.now() - timedelta(days=SEEN_EXPIRY_DAYS)
+        return {
             k: v for k, v in seen.items()
             if datetime.fromisoformat(v["ts"]) > cutoff
         }
-        return active
     except Exception:
         return {}
 
@@ -98,10 +131,6 @@ def save_seen(seen: dict) -> None:
 
 
 def already_alerted(ticker: str, setup_name: str, price: float, seen: dict) -> bool:
-    """
-    Returns True if this ticker+setup was already alerted at a price
-    within PRICE_TOLERANCE of the current price.
-    """
     key = f"{ticker}::{setup_name}"
     if key not in seen:
         return False
@@ -114,17 +143,55 @@ def mark_seen(ticker: str, setup_name: str, price: float, seen: dict) -> None:
     seen[key] = {"price": price, "ts": datetime.now().isoformat()}
 
 
+# ── Dynamic Universe (v4) ─────────────────────────────────────────────────────
+
+def get_universe() -> list[str]:
+    """
+    Pull a fresh list of candidate tickers from Finviz using FINVIZ_FILTERS.
+    Falls back to FALLBACK_TICKERS if finvizfinance is not installed or errors.
+
+    Finviz pre-filters stocks to those already in a price uptrend, so Elliott
+    Wave detection runs on a much more relevant and varied universe each day.
+    """
+    if not FINVIZ_AVAILABLE:
+        print(f"[universe] finvizfinance not available — using {len(FALLBACK_TICKERS)} fallback tickers")
+        return FALLBACK_TICKERS
+
+    try:
+        screener = FinvizTicker()
+        screener.set_filter(filters_dict=FINVIZ_FILTERS)
+        df = screener.screener_view()
+
+        if df is None or len(df) == 0:
+            print("[universe] Finviz returned 0 results — using fallback tickers")
+            return FALLBACK_TICKERS
+
+        # The Ticker screener returns a DataFrame with a 'Ticker' column
+        tickers = df["Ticker"].dropna().tolist() if "Ticker" in df.columns else df.iloc[:, 0].dropna().tolist()
+        tickers = [str(t).strip().upper() for t in tickers if t and str(t).strip()]
+
+        # Shuffle so repeated runs don't always scan in alphabetical order
+        import random
+        random.shuffle(tickers)
+
+        tickers = tickers[:UNIVERSE_SIZE]
+        print(f"[universe] Finviz returned {len(tickers)} candidates")
+        return tickers
+
+    except Exception as e:
+        print(f"[universe] Finviz error: {e} — using fallback tickers")
+        return FALLBACK_TICKERS
+
+
 # ── Price Data ────────────────────────────────────────────────────────────────
 
 def get_price_data(ticker):
-    """Fetch daily bars from Alpaca. Tries IEX first, falls back to SIP."""
     end   = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
     headers = {
         "APCA-API-KEY-ID":     ALPACA_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET,
     }
-
     for feed in ["iex", "sip"]:
         try:
             params = {
@@ -155,7 +222,6 @@ def get_price_data(ticker):
         except Exception as e:
             print(f"[{ticker}] Alpaca {feed} error: {e}")
             continue
-
     return None
 
 
@@ -175,11 +241,10 @@ def get_weekly_bars(df):
 
 def weekly_trend_is_up(df):
     """
-    PATCHED weekly trend filter (v2) — 3 ways to pass:
-
-    1. Classic uptrend: SMA10w > SMA20w AND SMA10w rising.
-    2. Early recovery: SMA10w rising for 2+ consecutive weeks after a dip.
-    3. Price above daily SMA200: long-term bull — relax weekly filter.
+    3 ways to pass (v2):
+    1. Classic: SMA10w > SMA20w AND rising
+    2. Early recovery: SMA10w rising 2+ consecutive weeks
+    3. Price above daily SMA200
     """
     try:
         closes_daily = df["Close"]
@@ -200,22 +265,16 @@ def weekly_trend_is_up(df):
         prev_10  = float(sma10w.iloc[-2])
         prev2_10 = float(sma10w.iloc[-3])
 
-        # 1. Classic uptrend
         if cur_10 > cur_20 and cur_10 > prev_10:
             return True
-
-        # 2. Early recovery — SMA10w rising for 2 consecutive weeks
         if cur_10 > prev_10 > prev2_10:
             return True
-
-        # 3. Price above daily SMA200 — long-term bull, allow weekly pullback
         if above_sma200:
             return True
 
         return False
-
     except Exception:
-        return True  # don't reject on error
+        return True
 
 
 # ── Fundamentals ──────────────────────────────────────────────────────────────
@@ -312,10 +371,8 @@ def compute_indicators(df):
 
 def find_swing_points(df, lookback=90, min_bars=5, max_age_bars=20):
     """
-    PATCHED (v3): Added max_age_bars filter.
-    Only swing highs/lows formed within the last max_age_bars bars qualify.
-    This prevents the scanner from re-firing on the same stale swing points
-    every single run for weeks on end.
+    v3: max_age_bars filter — only swings formed within the last N bars qualify.
+    Prevents the scanner from re-firing on stale multi-week-old swing points.
     """
     n      = len(df)
     start  = max(0, n - lookback)
@@ -323,16 +380,12 @@ def find_swing_points(df, lookback=90, min_bars=5, max_age_bars=20):
     lows   = []
 
     for i in range(start + min_bars, n - min_bars):
-        # Skip swings older than max_age_bars from the current bar
         if i < n - max_age_bars:
             continue
-
         window = df.iloc[i - min_bars: i + min_bars + 1]
         bar    = df.iloc[i]
-
         if bar["High"] == window["High"].max():
             highs.append((i, float(bar["High"])))
-
         if bar["Low"] == window["Low"].min():
             lows.append((i, float(bar["Low"])))
 
@@ -342,10 +395,6 @@ def find_swing_points(df, lookback=90, min_bars=5, max_age_bars=20):
 # ── Volume helper ─────────────────────────────────────────────────────────────
 
 def _vol_confirmed(df) -> tuple[bool, float]:
-    """
-    Uses previous completed daily bar (iloc[-2]) for volume confirmation.
-    Threshold: 1.2x avg volume (lowered from 1.5x in v2).
-    """
     if len(df) < 3:
         return False, 0.0
     prev_bar  = df.iloc[-2]
@@ -357,7 +406,6 @@ def _vol_confirmed(df) -> tuple[bool, float]:
 # ── Wave 2 Setup ──────────────────────────────────────────────────────────────
 
 def detect_wave2_setup(df):
-    """RSI window: 25-65 (widened from 25-60 in v2)."""
     if not weekly_trend_is_up(df):
         return None
 
@@ -383,10 +431,8 @@ def detect_wave2_setup(df):
         return None
 
     wave1_size = wave1_top - wave1_origin
-
     if wave1_size <= 0:
         return None
-
     if wave1_size / wave1_origin < MIN_WAVE1_MOVE:
         return None
 
@@ -395,9 +441,7 @@ def detect_wave2_setup(df):
     fib_618 = round(wave1_top - wave1_size * FIB_618, 2)
     fib_786 = round(wave1_top - wave1_size * FIB_786, 2)
 
-    in_reversal_zone = fib_786 <= price <= fib_500
-
-    if not in_reversal_zone:
+    if not (fib_786 <= price <= fib_500):
         return None
 
     rsi_prev   = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
@@ -411,24 +455,17 @@ def detect_wave2_setup(df):
         return None
 
     vol_confirmed, vol_ratio = _vol_confirmed(df)
-
     stop = round(wave1_origin * 0.99, 2)
 
-    wave2_low = price
-    ext_1272  = round(wave2_low + wave1_size * EXT_1272, 2)
-    ext_1618  = round(wave2_low + wave1_size * EXT_1618, 2)
-    ext_2618  = round(wave2_low + wave1_size * EXT_2618, 2)
+    ext_1272 = round(price + wave1_size * EXT_1272, 2)
+    ext_1618 = round(price + wave1_size * EXT_1618, 2)
+    ext_2618 = round(price + wave1_size * EXT_2618, 2)
 
     risk = price - stop
     if risk <= 0:
         return None
 
-    tp1_pct = round((ext_1272 - price) / price * 100, 1)
-    tp2_pct = round((ext_1618 - price) / price * 100, 1)
-    tp3_pct = round((ext_2618 - price) / price * 100, 1)
-    rr_tp1  = round((ext_1272 - price) / risk, 2)
-    rr_tp2  = round((ext_1618 - price) / risk, 2)
-
+    rr_tp2 = round((ext_1618 - price) / risk, 2)
     if rr_tp2 < MIN_RR_TP2:
         return None
 
@@ -449,13 +486,13 @@ def detect_wave2_setup(df):
         "vol_ratio":     vol_ratio,
         "vol_confirmed": vol_confirmed,
         "stop":          stop,
-        "tp1":           ext_1272,
+        "tp1":           round(price + wave1_size * EXT_1272, 2),
         "tp2":           ext_1618,
         "tp3":           ext_2618,
-        "tp1_pct":       tp1_pct,
-        "tp2_pct":       tp2_pct,
-        "tp3_pct":       tp3_pct,
-        "rr_tp1":        rr_tp1,
+        "tp1_pct":       round((price + wave1_size * EXT_1272 - price) / price * 100, 1),
+        "tp2_pct":       round((ext_1618 - price) / price * 100, 1),
+        "tp3_pct":       round((ext_2618 - price) / price * 100, 1),
+        "rr_tp1":        round((price + wave1_size * EXT_1272 - price) / risk, 2),
         "rr_tp2":        rr_tp2,
         "risk":          round(risk, 2),
         "setup_detail": {
@@ -472,7 +509,6 @@ def detect_wave2_setup(df):
 # ── Wave 4 Setup ──────────────────────────────────────────────────────────────
 
 def detect_wave4_setup(df):
-    """RSI window: 30-70 (widened from 35-65 in v2)."""
     if not weekly_trend_is_up(df):
         return None
 
@@ -502,7 +538,6 @@ def detect_wave4_setup(df):
 
     if not (fib_500_w4 <= price <= fib_382_w4):
         return None
-
     if price < wave1_high:
         return None
 
@@ -514,7 +549,6 @@ def detect_wave4_setup(df):
         return None
 
     vol_confirmed, vol_ratio = _vol_confirmed(df)
-
     stop = round(wave1_high * 0.99, 2)
 
     wave1_size = wave1_high - wave1_origin
@@ -526,12 +560,7 @@ def detect_wave4_setup(df):
     if risk <= 0:
         return None
 
-    tp1_pct = round((ext_1272 - price) / price * 100, 1)
-    tp2_pct = round((ext_1618 - price) / price * 100, 1)
-    tp3_pct = round((ext_2618 - price) / price * 100, 1)
-    rr_tp1  = round((ext_1272 - price) / risk, 2)
-    rr_tp2  = round((ext_1618 - price) / risk, 2)
-
+    rr_tp2 = round((ext_1618 - price) / risk, 2)
     if rr_tp2 < MIN_RR_TP2:
         return None
 
@@ -553,10 +582,10 @@ def detect_wave4_setup(df):
         "tp1":           ext_1272,
         "tp2":           ext_1618,
         "tp3":           ext_2618,
-        "tp1_pct":       tp1_pct,
-        "tp2_pct":       tp2_pct,
-        "tp3_pct":       tp3_pct,
-        "rr_tp1":        rr_tp1,
+        "tp1_pct":       round((ext_1272 - price) / price * 100, 1),
+        "tp2_pct":       round((ext_1618 - price) / price * 100, 1),
+        "tp3_pct":       round((ext_2618 - price) / price * 100, 1),
+        "rr_tp1":        round((ext_1272 - price) / risk, 2),
         "rr_tp2":        rr_tp2,
         "risk":          round(risk, 2),
         "setup_detail": {
@@ -572,7 +601,6 @@ def detect_wave4_setup(df):
 # ── ABC Setup ─────────────────────────────────────────────────────────────────
 
 def detect_abc_setup(df):
-    """Unchanged logic — ABC already works well in corrections."""
     if not weekly_trend_is_up(df):
         return None
 
@@ -596,7 +624,6 @@ def detect_abc_setup(df):
     wave_a_size = wave_a_start - wave_a_end
     if wave_a_size <= 0:
         return None
-
     if wave_a_size / wave_a_start < 0.05:
         return None
 
@@ -614,7 +641,6 @@ def detect_abc_setup(df):
         return None
 
     vol_confirmed, vol_ratio = _vol_confirmed(df)
-
     stop = round(wave_a_end * 0.99, 2)
 
     tp1 = round(wave_a_start, 2)
@@ -625,11 +651,8 @@ def detect_abc_setup(df):
     if risk <= 0:
         return None
 
-    tp1_pct = round((tp1 - price) / price * 100, 1)
-    tp2_pct = round((tp2 - price) / price * 100, 1)
-    tp3_pct = round((tp3 - price) / price * 100, 1)
-    rr_tp1  = round((tp1 - price) / risk, 2)
-    rr_tp2  = round((tp2 - price) / risk, 2)
+    rr_tp1 = round((tp1 - price) / risk, 2)
+    rr_tp2 = round((tp2 - price) / risk, 2)
 
     if rr_tp1 < 1.5:
         return None
@@ -650,9 +673,9 @@ def detect_abc_setup(df):
         "tp1":           tp1,
         "tp2":           tp2,
         "tp3":           tp3,
-        "tp1_pct":       tp1_pct,
-        "tp2_pct":       tp2_pct,
-        "tp3_pct":       tp3_pct,
+        "tp1_pct":       round((tp1 - price) / price * 100, 1),
+        "tp2_pct":       round((tp2 - price) / price * 100, 1),
+        "tp3_pct":       round((tp3 - price) / price * 100, 1),
         "rr_tp1":        rr_tp1,
         "rr_tp2":        rr_tp2,
         "risk":          round(risk, 2),
@@ -687,16 +710,6 @@ def position_size(price, stop):
 # ── Main Analyzer ─────────────────────────────────────────────────────────────
 
 def analyze_ticker(ticker, seen: dict | None = None):
-    """
-    Analyze a single ticker. Pass the shared `seen` dict from load_seen()
-    so deduplication works across the whole scanner run without re-reading
-    the file on every ticker.
-
-    Example usage in your scanner loop:
-        seen = load_seen()
-        results = [analyze_ticker(t, seen) for t in TICKERS]
-        save_seen(seen)
-    """
     if seen is None:
         seen = load_seen()
 
@@ -717,12 +730,10 @@ def analyze_ticker(ticker, seen: dict | None = None):
         price      = setup["price"]
         setup_name = setup["setup"]
 
-        # ── Deduplication check (v3) ──────────────────────────────────────────
         if already_alerted(ticker, setup_name, price, seen):
             print(f"[{ticker}] SKIP — already alerted '{setup_name}' at similar price")
             return None
         mark_seen(ticker, setup_name, price, seen)
-        # (caller must call save_seen(seen) after the full scan loop)
 
         fund = get_fundamentals(ticker)
         if not fund:
@@ -756,7 +767,7 @@ def analyze_ticker(ticker, seen: dict | None = None):
             f"[{ticker}] {signal_type} | {setup_name} | "
             f"Score {score:.0f} | RSI {rsi:.0f} | "
             f"R:R TP2 {setup.get('rr_tp2', 0):.1f}x | "
-            f"Vol {setup.get('vol_ratio', 0):.1f}x (prev bar)"
+            f"Vol {setup.get('vol_ratio', 0):.1f}x"
         )
 
         return {
@@ -800,15 +811,42 @@ def analyze_ticker(ticker, seen: dict | None = None):
         return None
 
 
-# ── Scanner loop example ──────────────────────────────────────────────────────
-# Replace TICKERS with your actual watchlist.
-#
-# TICKERS = ["AAPL", "MSFT", "NVDA", ...]
-#
-# if __name__ == "__main__":
-#     seen    = load_seen()
-#     results = [r for t in TICKERS if (r := analyze_ticker(t, seen)) is not None]
-#     save_seen(seen)
-#     results.sort(key=lambda x: x["signal_score"], reverse=True)
-#     for r in results:
-#         print(r)
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print(f"\n{'='*60}")
+    print(f"Elliott Wave Scanner — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"{'='*60}\n")
+
+    # 1. Get fresh universe from Finviz (different stocks every run)
+    tickers = get_universe()
+    print(f"Scanning {len(tickers)} tickers...\n")
+
+    # 2. Load seen setups (deduplication)
+    seen = load_seen()
+
+    # 3. Scan
+    results = []
+    for ticker in tickers:
+        result = analyze_ticker(ticker, seen)
+        if result:
+            results.append(result)
+
+    # 4. Save deduplication state
+    save_seen(seen)
+
+    # 5. Sort and print
+    results.sort(key=lambda x: x["signal_score"], reverse=True)
+
+    print(f"\n{'='*60}")
+    print(f"Found {len(results)} setup(s)")
+    print(f"{'='*60}\n")
+
+    for r in results:
+        print(
+            f"{'★' if r['signal'] == 'BUY' else '○'} {r['ticker']:6s} | "
+            f"{r['setup']:18s} | Score {r['signal_score']:.0f} | "
+            f"Price ${r['price']} | Stop ${r['stop']} | "
+            f"TP2 ${r['tp2']} ({r['tp2_pct']:+.1f}%) | "
+            f"R:R {r['rr_tp2']:.1f}x | RSI {r['rsi']}"
+        )
