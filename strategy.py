@@ -7,18 +7,10 @@ PATCH v4 — Dynamic Ticker Universe via Finviz Screener
 The core problem: a static list of ~219 tickers means the scanner always
 sees the same stocks and finds the same setups.
 
-Fix: get_universe() pulls a FRESH list of candidates from Finviz every run
-using filters that pre-qualify stocks before Elliott Wave analysis:
-  - Price > SMA20 AND SMA20 > SMA50 (price structure uptrend)
-  - RSI between 40-70 (not overbought, not in freefall)
-  - Average volume > 300k (liquid enough)
-  - Market cap > $300M (small cap and above)
-  - Country = USA
-  - Optionally: sector filter (edit SECTORS below)
-
-This replaces the need for a hardcoded watchlist entirely.
-Run the scanner daily — it fetches a different set of candidates each time
-as market conditions shift, so you always see fresh setups.
+Fix: get_universe() pulls a FRESH list of candidates from Finviz every run.
+Finviz filters are intentionally minimal — only price and volume floors.
+All real filtering (trend, RSI, quality) happens inside the strategy logic
+on actual price data, which is far more accurate than Finviz's preset labels.
 
 All v3 patches are preserved:
   v3: Deduplication (seen_setups.json), swing recency filter (max_age_bars),
@@ -33,6 +25,7 @@ import os
 import json
 import math
 import pathlib
+import random
 import traceback
 import pandas as pd
 import numpy as np
@@ -77,27 +70,19 @@ MIN_WAVE1_MOVE    = 0.05
 MIN_RR_TP2        = 2.0
 
 # ── Screener config ───────────────────────────────────────────────────────────
-# How many tickers to pull from Finviz per run.
-# More = more setups found but slower scan. 300-500 is a good balance.
-UNIVERSE_SIZE = 400
+# Keep UNIVERSE_SIZE high — the strategy's own filters will trim it down.
+UNIVERSE_SIZE = 500
 
-# Finviz filter preset — targets stocks in a price uptrend with room to run.
-# See all filter keys: https://finvizfinance.readthedocs.io/en/latest/
+# INTENTIONALLY MINIMAL — do not add SMA, RSI, or Market Cap filters here.
+# Those Finviz presets map to narrow bands and cap results at ~50 tickers.
+# All real filtering is done on actual Alpaca price data inside the strategy.
 FINVIZ_FILTERS = {
-    "Price":           "Over $5",          # avoid penny stocks
-    "Average Volume":  "Over 300K",        # liquid enough for clean price action
-    "Market Cap.":     "Small ($300mln to $2bln)",  # focus: small/mid cap
-    "Country":         "USA",
-    "20-Day Simple Moving Average": "Price above SMA20",
-    "50-Day Simple Moving Average": "Price above SMA50",
-    "RSI (14)":        "Not Overbought (50)",  # RSI between 50-70 range
+    "Price":          "Over $5",      # avoid penny stocks
+    "Average Volume": "Over 300K",    # need liquidity for clean price data
+    "Country":        "USA",          # US-listed only (Alpaca coverage)
 }
 
-# Optional: restrict to specific sectors. Comment out to scan all sectors.
-# FINVIZ_FILTERS["Sector"] = "Technology"
-
-# Fallback list used if finvizfinance is not installed.
-# Replace with your own watchlist or leave as-is.
+# Fallback list if finvizfinance is not installed or Finviz is unreachable.
 FALLBACK_TICKERS = [
     "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","JPM","V","UNH",
     "LLY","XOM","JNJ","PG","MA","HD","MRK","ABBV","CVX","AVGO",
@@ -145,17 +130,20 @@ def mark_seen(ticker: str, setup_name: str, price: float, seen: dict) -> None:
 
 # ── Dynamic Universe (v4) ─────────────────────────────────────────────────────
 
-def get_universe() -> list[str]:
+def get_universe() -> list:
     """
-    Pull a fresh list of candidate tickers from Finviz using FINVIZ_FILTERS.
-    Falls back to FALLBACK_TICKERS if finvizfinance is not installed or errors.
+    Pull a fresh list of candidate tickers from Finviz.
 
-    Finviz pre-filters stocks to those already in a price uptrend, so Elliott
-    Wave detection runs on a much more relevant and varied universe each day.
+    Uses minimal filters (price > $5, volume > 300K, USA) so Finviz returns
+    a large, varied universe. All Elliott Wave and quality filtering happens
+    downstream on real Alpaca price data — not on Finviz preset labels.
+
+    Results are shuffled so each run scans stocks in a different order,
+    preventing the same tickers from always being evaluated first.
     """
     if not FINVIZ_AVAILABLE:
         print(f"[universe] finvizfinance not available — using {len(FALLBACK_TICKERS)} fallback tickers")
-        return FALLBACK_TICKERS
+        return list(FALLBACK_TICKERS)
 
     try:
         screener = FinvizTicker()
@@ -164,23 +152,30 @@ def get_universe() -> list[str]:
 
         if df is None or len(df) == 0:
             print("[universe] Finviz returned 0 results — using fallback tickers")
-            return FALLBACK_TICKERS
+            return list(FALLBACK_TICKERS)
 
-        # The Ticker screener returns a DataFrame with a 'Ticker' column
-        tickers = df["Ticker"].dropna().tolist() if "Ticker" in df.columns else df.iloc[:, 0].dropna().tolist()
+        # Handle both possible column names
+        if "Ticker" in df.columns:
+            tickers = df["Ticker"].dropna().tolist()
+        else:
+            tickers = df.iloc[:, 0].dropna().tolist()
+
         tickers = [str(t).strip().upper() for t in tickers if t and str(t).strip()]
 
-        # Shuffle so repeated runs don't always scan in alphabetical order
-        import random
-        random.shuffle(tickers)
+        if len(tickers) == 0:
+            print("[universe] Finviz returned 0 valid tickers — using fallback")
+            return list(FALLBACK_TICKERS)
 
+        # Shuffle so each run sees stocks in a different order
+        random.shuffle(tickers)
         tickers = tickers[:UNIVERSE_SIZE]
+
         print(f"[universe] Finviz returned {len(tickers)} candidates")
         return tickers
 
     except Exception as e:
         print(f"[universe] Finviz error: {e} — using fallback tickers")
-        return FALLBACK_TICKERS
+        return list(FALLBACK_TICKERS)
 
 
 # ── Price Data ────────────────────────────────────────────────────────────────
@@ -394,7 +389,7 @@ def find_swing_points(df, lookback=90, min_bars=5, max_age_bars=20):
 
 # ── Volume helper ─────────────────────────────────────────────────────────────
 
-def _vol_confirmed(df) -> tuple[bool, float]:
+def _vol_confirmed(df):
     if len(df) < 3:
         return False, 0.0
     prev_bar  = df.iloc[-2]
@@ -709,7 +704,7 @@ def position_size(price, stop):
 
 # ── Main Analyzer ─────────────────────────────────────────────────────────────
 
-def analyze_ticker(ticker, seen: dict | None = None):
+def analyze_ticker(ticker, seen=None):
     if seen is None:
         seen = load_seen()
 
@@ -818,24 +813,19 @@ if __name__ == "__main__":
     print(f"Elliott Wave Scanner — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*60}\n")
 
-    # 1. Get fresh universe from Finviz (different stocks every run)
     tickers = get_universe()
     print(f"Scanning {len(tickers)} tickers...\n")
 
-    # 2. Load seen setups (deduplication)
     seen = load_seen()
 
-    # 3. Scan
     results = []
     for ticker in tickers:
         result = analyze_ticker(ticker, seen)
         if result:
             results.append(result)
 
-    # 4. Save deduplication state
     save_seen(seen)
 
-    # 5. Sort and print
     results.sort(key=lambda x: x["signal_score"], reverse=True)
 
     print(f"\n{'='*60}")
