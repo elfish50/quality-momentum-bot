@@ -19,7 +19,7 @@ async def error_handler(update, context):
     error = context.error
     if isinstance(error, Conflict):
         print("WARNING: Conflict detected, ignoring - Railway will manage restarts.")
-        return  # Don't kill the process
+        return
     print(f"Unhandled error: {error}")
     traceback.print_exc()
 
@@ -28,6 +28,14 @@ async def scheduled_scan(bot):
     from scanner import run_universe_scan
     print(f"Scan starting at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     await run_universe_scan(bot, CHAT_ID)
+
+
+async def scheduled_monitor(bot):
+    """Runs every 5 minutes during market hours — checks TP1, stop, and closes."""
+    from monitor import run_monitor
+    print(f"[monitor] Check at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, lambda: run_monitor(bot=bot, chat_id=CHAT_ID))
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -42,12 +50,14 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/unwatch AAPL - Remove from watchlist\n"
         "/list - Show watchlist\n"
         "/scan_watchlist - Scan watchlist\n"
+        "/positions - Open tracked positions\n"
         "/portfolio - Paper account P&L\n"
         "/trades - Recent trade history\n"
         "/cancel - Cancel all open orders\n"
         "/strategy - How it works\n"
         "/settings - Bot settings\n"
-        "Auto-scans: Mon-Fri 10AM, 12:30PM, 2:30PM ET"
+        "Auto-scans: Mon-Fri 10AM, 12:30PM, 2:30PM ET\n"
+        "Monitor: every 5 min (TP1 exits + stop tracking)"
     )
 
 
@@ -64,9 +74,9 @@ async def cmd_strategy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  Wave 4: below Wave 1 high\n"
         "  ABC: below Wave A low\n\n"
         "TARGETS:\n"
-        "  TP1: 1.272x Fib extension\n"
-        "  TP2: 1.618x Fib extension\n"
-        "  TP3: 2.618x stretch target\n\n"
+        "  TP1: 1.272x — sell 1/3, stop → break-even\n"
+        "  TP2: 1.618x — sell remaining 2/3\n"
+        "  TP3: 2.618x — stretch target\n\n"
         "SIGNALS:\n"
         "  BUY = volume confirmed (auto-executed)\n"
         "  WATCH = wait for volume before entering\n\n"
@@ -113,6 +123,16 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "Reasons: no Elliott Wave setup, quality screen failed,\n"
                 "RSI not confirming, or R:R too low."
             )
+    except Exception:
+        await update.message.reply_text(f"Error:\n{traceback.format_exc()[-400:]}")
+
+
+async def cmd_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show all open tracked positions with entry, stop, and TP levels."""
+    from positions import format_open_positions
+    try:
+        msg = format_open_positions()
+        await update.message.reply_text(msg)
     except Exception:
         await update.message.reply_text(f"Error:\n{traceback.format_exc()[-400:]}")
 
@@ -218,14 +238,14 @@ async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_universe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    from universe import load_universe
-    await update.message.reply_text("Checking universe...")
+    from strategy import get_universe
+    await update.message.reply_text("Fetching live universe from Finviz...")
     try:
-        u     = load_universe()
-        all_t = u.get("ALL", [])
+        loop    = asyncio.get_event_loop()
+        tickers = await loop.run_in_executor(None, get_universe)
         await update.message.reply_text(
-            f"Universe: {len(all_t):,} tickers (yfinance most actives)\n"
-            f"Sample: {', '.join(all_t[:10])}"
+            f"Universe: {len(tickers):,} tickers (Finviz live screener)\n"
+            f"Sample: {', '.join(tickers[:10])}"
         )
     except Exception:
         await update.message.reply_text(f"Error:\n{traceback.format_exc()[-400:]}")
@@ -238,13 +258,14 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Strategy:  Elliott Wave + Fibonacci\n"
         "Direction: LONG ONLY\n"
         "Timeframe: Daily bars\n"
-        "Universe:  yfinance most actives (~100 tickers)\n"
+        "Universe:  Finviz live screener (~400 tickers)\n"
         "Data:      Alpaca + Finnhub\n"
         "Account:   $1k paper\n"
         "Risk:      $100/trade\n"
         "BUY:       volume confirmed (auto-executed)\n"
         "WATCH:     volume pending (alert only)\n"
-        "Schedule:  Mon-Fri 10AM, 12:30PM, 2:30PM ET"
+        "Schedule:  Mon-Fri 10AM, 12:30PM, 2:30PM ET\n"
+        "Monitor:   every 5 min (TP1 exits + stops)"
     )
 
 
@@ -272,14 +293,15 @@ def main():
     bot_app.add_handler(CommandHandler("universe",       cmd_universe))
     bot_app.add_handler(CommandHandler("settings",       cmd_settings))
     bot_app.add_handler(CommandHandler("portfolio",      cmd_portfolio))
+    bot_app.add_handler(CommandHandler("positions",      cmd_positions))
     bot_app.add_handler(CommandHandler("trades",         cmd_trades))
     bot_app.add_handler(CommandHandler("cancel",         cmd_cancel))
 
-    # Capture the running event loop for use by APScheduler threads
     loop = None
 
     scheduler = AsyncIOScheduler(timezone="America/New_York")
 
+    # ── Scans ─────────────────────────────────────────────────────────────────
     scheduler.add_job(
         lambda: asyncio.run_coroutine_threadsafe(scheduled_scan(bot_app.bot), loop),
         "cron", day_of_week="mon-fri", hour="10", minute="0", id="scan_10am"
@@ -293,13 +315,26 @@ def main():
         "cron", day_of_week="mon-fri", hour="14", minute="30", id="scan_230pm"
     )
 
+    # ── Position monitor — every 5 min, market hours only ────────────────────
+    # monitor.py checks _is_market_open() internally so off-hours calls are no-ops
+    scheduler.add_job(
+        lambda: asyncio.run_coroutine_threadsafe(scheduled_monitor(bot_app.bot), loop),
+        "cron",
+        day_of_week="mon-fri",
+        hour="9-16",          # 9AM-4PM ET window (monitor skips if market closed)
+        minute="*/5",         # every 5 minutes
+        id="monitor_5min"
+    )
+
     async def on_startup(application):
         nonlocal loop
-        loop = asyncio.get_event_loop()  # Capture the running event loop
+        loop = asyncio.get_event_loop()
         scheduler.start()
         await application.bot.delete_webhook(drop_pending_updates=True)
-        print("Scheduler started - scans at 10AM, 12:30PM, 2:30PM ET")
-        print(f"Next scan times: {[str(job.next_run_time) for job in scheduler.get_jobs()]}")
+        print("Scheduler started")
+        print("  Scans:   Mon-Fri 10AM, 12:30PM, 2:30PM ET")
+        print("  Monitor: Mon-Fri 9AM-4PM every 5 min (TP1 exits + stop tracking)")
+        print(f"  Next jobs: {[str(job.next_run_time) for job in scheduler.get_jobs()]}")
 
     bot_app.post_init = on_startup
     print("Quality Momentum Bot running!")
