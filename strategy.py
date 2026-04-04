@@ -9,16 +9,18 @@ Root cause of the 50-ticker problem:
   with a 403 Forbidden error. finvizfinance silently returns only the
   first page (20-50 rows) before getting blocked.
 
-Fix: get_universe() now uses only Alpaca APIs — which already work
-perfectly since the bot is authenticated there.
+  On weekends, Alpaca's live dailyBar snapshots are empty, so volume
+  filters wiped everything out. Fixed by falling back to prevDailyBar
+  (previous close data) when dailyBar is unavailable.
 
-Universe is built in 2 layers:
-  Layer 1: Alpaca most-actives endpoint  (~100 high-volume stocks today)
+Fix: get_universe() uses only Alpaca APIs — works from Railway,
+     works on weekends, works at any time of day.
+
+Universe built in 2 layers:
+  Layer 1: Alpaca most-actives endpoint (~100 high-volume stocks)
   Layer 2: Random sample from all active Alpaca assets, filtered by
            price > $5 and volume > 300k via snapshot batch calls
-
-Each run shuffles the result so the scanner always sees fresh stocks.
-No external scraping — no blocks, no 403s, no install required.
+           (uses prevDailyBar fallback when market is closed)
 
 All previous patches preserved:
   v4: Dynamic universe
@@ -128,7 +130,10 @@ def mark_seen(ticker: str, setup_name: str, price: float, seen: dict) -> None:
 # ── Dynamic Universe via Alpaca (v5) ──────────────────────────────────────────
 
 def _get_most_actives() -> list:
-    """Top 100 most-active US stocks by volume today from Alpaca."""
+    """
+    Top 100 most-active US stocks by volume from Alpaca's screener.
+    Works on weekends — this endpoint returns historical data, not live.
+    """
     try:
         r = requests.get(
             ALPACA_SCREEN_URL,
@@ -181,8 +186,12 @@ def _get_alpaca_assets() -> list:
 
 def _snapshot_filter(tickers: list, min_price: float = 5.0, min_volume: float = 300_000) -> list:
     """
-    Batch-filter tickers by today's close price and volume using
-    Alpaca snapshot endpoint. Processes in chunks of 100.
+    Filter tickers by price and volume using Alpaca snapshots.
+
+    Weekend/after-hours safe: tries dailyBar first (live session data),
+    falls back to prevDailyBar (last completed trading day) when the
+    market is closed and dailyBar is empty. This ensures the universe
+    is always populated regardless of what day/time the scan runs.
     """
     filtered   = []
     chunk_size = 100
@@ -200,7 +209,8 @@ def _snapshot_filter(tickers: list, min_price: float = 5.0, min_volume: float = 
                 continue
             for sym, snap in r.json().items():
                 try:
-                    daily  = snap.get("dailyBar", {}) or {}
+                    # dailyBar = live today | prevDailyBar = last close (weekend safe)
+                    daily  = snap.get("dailyBar") or snap.get("prevDailyBar") or {}
                     close  = float(daily.get("c", 0) or 0)
                     volume = float(daily.get("v", 0) or 0)
                     if close >= min_price and volume >= min_volume:
@@ -217,12 +227,14 @@ def _snapshot_filter(tickers: list, min_price: float = 5.0, min_volume: float = 
 def get_universe() -> list:
     """
     Build a fresh, varied universe every run using only Alpaca APIs.
+    No Finviz — no 403 blocks, no scraping, works from any server.
 
-    Layer 1: most-actives (top 100 by volume today — always relevant)
+    Layer 1: most-actives (top 100 by volume — always relevant)
     Layer 2: random sample of all Alpaca assets, filtered by price+volume
+             using prevDailyBar fallback so weekends work fine
 
     Shuffled so each scan sees stocks in a different order.
-    Falls back to FALLBACK_TICKERS only if Alpaca calls all fail.
+    Falls back to FALLBACK_TICKERS only if all Alpaca calls fail.
     """
     result = []
 
@@ -238,7 +250,7 @@ def get_universe() -> list:
         filtered    = _snapshot_filter(sample)
         result.extend(filtered)
 
-    # Deduplicate
+    # Deduplicate, preserving order
     seen_set = set()
     deduped  = []
     for t in result:
@@ -678,11 +690,12 @@ def position_size(price, stop):
     if shares < 1:
         shares = 1
     max_shares = math.floor(ACCOUNT / price) if price > 0 else shares
+    shares     = min(shares, max_shares)
     return {
-        "shares":       min(shares, max_shares),
+        "shares":       shares,
         "risk_dollars": round(risk_dollars, 2),
-        "position_val": round(min(shares, max_shares) * price, 2),
-        "pct_account":  round(min(shares, max_shares) * price / ACCOUNT * 100, 1),
+        "position_val": round(shares * price, 2),
+        "pct_account":  round(shares * price / ACCOUNT * 100, 1),
     }
 
 
