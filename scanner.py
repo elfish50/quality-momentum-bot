@@ -3,15 +3,19 @@ scanner.py - Elliott Wave + Fibonacci Scanner
 Berkshire Quality Screen + Wave 2 / Wave 4 / ABC setups
 LONG ONLY | Daily bars
 BUY = volume confirmed + auto-executed | WATCH = waiting for volume
+
+v4 fix: universe now comes from strategy.get_universe() (Finviz live screener)
+instead of the old static load_universe() / get_all_tickers() lists.
+Deduplication (seen dict) is shared across the full scan loop so the same
+setup is never re-alerted within SEEN_EXPIRY_DAYS days.
 """
 import gc
 import time
 import asyncio
 import traceback
 from datetime import datetime
-from universe import get_all_tickers
-from screener import get_priority_tickers
-from strategy import analyze_ticker
+
+from strategy import analyze_ticker, get_universe, load_seen, save_seen
 
 BATCH_SIZE  = 10
 BATCH_DELAY = 1
@@ -19,24 +23,30 @@ MAX_STOCKS  = 500
 
 
 def run_scan(tickers=None):
-    start   = time.time()
+    start = time.time()
+
     if not tickers:
-        u = get_all_tickers()
-        priority = get_priority_tickers(universe=u)
-        rest = [t for t in u if t not in set(priority)]
-        import random; random.shuffle(rest)
-        tickers = priority + rest
+        tickers = get_universe()          # <-- Finviz live screener, fresh every run
+
     tickers = tickers[:MAX_STOCKS]
     alerts  = []
+
+    # Load seen once for the whole scan — deduplication across all tickers
+    seen = load_seen()
 
     print(f"Scanning {len(tickers)} tickers...")
 
     for i, ticker in enumerate(tickers):
         try:
-            sig = analyze_ticker(ticker)
+            sig = analyze_ticker(ticker, seen)   # pass shared seen dict
             if sig:
                 alerts.append(sig)
-                print(f"[{sig['signal']}] {ticker} | {sig['setup']} | Score {sig['signal_score']} | R:R TP2 {sig['rr_tp2']:.1f}x | Vol {sig['vol_ratio']:.1f}x")
+                print(
+                    f"[{sig['signal']}] {ticker} | {sig['setup']} | "
+                    f"Score {sig['signal_score']} | "
+                    f"R:R TP2 {sig['rr_tp2']:.1f}x | "
+                    f"Vol {sig['vol_ratio']:.1f}x"
+                )
         except Exception:
             pass
         finally:
@@ -45,6 +55,9 @@ def run_scan(tickers=None):
         if (i + 1) % BATCH_SIZE == 0:
             print(f"Progress: {i+1}/{len(tickers)} | Alerts: {len(alerts)}")
             time.sleep(BATCH_DELAY)
+
+    # Save deduplication state once after the full scan
+    save_seen(seen)
 
     alerts.sort(key=lambda x: x["signal_score"], reverse=True)
     elapsed = time.time() - start
@@ -177,14 +190,11 @@ def format_summary(alerts, elapsed, universe_size):
 
 
 async def run_universe_scan(bot, chat_id, tickers=None):
-    from universe import load_universe
-
     if tickers:
         scan_list     = tickers
         universe_size = len(tickers)
     else:
-        u             = load_universe()
-        scan_list     = u.get("ALL", [])[:MAX_STOCKS]
+        scan_list     = get_universe()        # <-- Finviz live screener
         universe_size = len(scan_list)
 
     await bot.send_message(
