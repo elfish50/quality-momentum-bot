@@ -44,7 +44,7 @@ FINNHUB_KEY   = os.getenv("FINNHUB_KEY", "")
 
 ALPACA_URL        = "https://data.alpaca.markets/v2"
 ALPACA_SCREEN_URL = "https://data.alpaca.markets/v1beta1/screener/stocks/most-actives"
-ALPACA_ASSETS_URL = "https://api.alpaca.markets/v2/assets"
+ALPACA_ASSETS_URL = "https://paper-api.alpaca.markets/v2/assets"
 FINNHUB_URL       = "https://finnhub.io/api/v1"
 
 HEADERS = {
