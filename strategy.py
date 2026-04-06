@@ -68,7 +68,7 @@ EXT_2618 = 2.618
 
 # ── Strategy thresholds ───────────────────────────────────────────────────────
 VOL_CONFIRM_RATIO = 1.2
-MIN_QUALITY_SCORE = 25   # v6: lowered from 40 — Finnhub gaps shouldn't drop valid setups
+MIN_QUALITY_SCORE = 25
 MIN_WAVE1_MOVE    = 0.05
 MIN_RR_TP2        = 2.0
 
@@ -125,14 +125,9 @@ def mark_seen(ticker: str, setup_name: str, price: float, seen: dict) -> None:
     seen[key] = {"price": price, "ts": datetime.now().isoformat()}
 
 
-# ── Dynamic Universe via Alpaca (v6) ──────────────────────────────────────────
+# ── Dynamic Universe via Alpaca ───────────────────────────────────────────────
 
 def _get_most_actives() -> list:
-    """
-    Top 200 most-active US stocks by volume from Alpaca's screener.
-    Expanded from 100 → 200 in v6 to widen the quality pool.
-    Works on weekends — returns historical data, not live.
-    """
     try:
         r = requests.get(
             ALPACA_SCREEN_URL,
@@ -157,12 +152,15 @@ def _get_most_actives() -> list:
 def _get_alpaca_assets() -> list:
     """All active tradable US equity assets from Alpaca (~8000+ symbols)."""
     try:
+        print(f"[universe] assets URL: {ALPACA_ASSETS_URL}")
+        print(f"[universe] key present: {bool(ALPACA_KEY)}, secret present: {bool(ALPACA_SECRET)}")
         r = requests.get(
             ALPACA_ASSETS_URL,
             headers=HEADERS,
             params={"status": "active", "asset_class": "us_equity"},
             timeout=30
         )
+        print(f"[universe] assets response {r.status_code}: {r.text[:200]}")
         if not r.ok:
             print(f"[universe] assets error {r.status_code}")
             return []
@@ -184,13 +182,6 @@ def _get_alpaca_assets() -> list:
 
 
 def _snapshot_filter(tickers: list, min_price: float = 5.0, min_volume: float = 300_000) -> list:
-    """
-    Filter tickers by price and volume using Alpaca snapshots.
-
-    v6: tries `sip` feed first (broader coverage than iex), falls back
-    to `iex` on error per chunk.  Weekend-safe: uses prevDailyBar fallback
-    when dailyBar is empty (market closed).
-    """
     filtered   = []
     chunk_size = 100
 
@@ -227,16 +218,6 @@ def _snapshot_filter(tickers: list, min_price: float = 5.0, min_volume: float = 
 
 
 def get_universe() -> list:
-    """
-    Build a fresh, varied universe every run using only Alpaca APIs.
-
-    Layer 1: most-actives top 200 (v6: was 100)
-    Layer 2: random sample of all Alpaca assets, filtered by price+volume
-             using sip feed first, iex fallback, prevDailyBar weekend safe.
-
-    Falls back to FALLBACK_TICKERS only if <20 tickers are returned
-    (v6: was <10 — more aggressive failsafe).
-    """
     result = []
 
     most_actives = _get_most_actives()
@@ -271,7 +252,6 @@ def get_universe() -> list:
     return final
 
 
-# keep load_universe as alias for bot.py /universe command
 def load_universe() -> list:
     return get_universe()
 
@@ -350,17 +330,16 @@ def weekly_trend_is_up(df):
 
 # ── Fundamentals ──────────────────────────────────────────────────────────────
 
-# v6: default skeleton so quality_score() always gets real numbers, not {}
 _FUND_DEFAULT = {
-    "roe":          0.0,
-    "gross_margin": 0.0,
-    "debt_equity":  999.0,
-    "eps_growth":   0.0,
-    "pe_ratio":     0.0,
-    "sector":       "Unknown",
-    "name":         "",
-    "market_cap":   0.0,
-    "_data_missing": True,   # flag so we can loosen quality gate downstream
+    "roe":           0.0,
+    "gross_margin":  0.0,
+    "debt_equity":   999.0,
+    "eps_growth":    0.0,
+    "pe_ratio":      0.0,
+    "sector":        "Unknown",
+    "name":          "",
+    "market_cap":    0.0,
+    "_data_missing": True,
 }
 
 
@@ -392,7 +371,6 @@ def get_fundamentals(ticker):
             "name":         p.get("name", ticker),
             "market_cap":   safe(p.get("marketCapitalization")) * 1_000_000,
         }
-        # If all core metrics are zero, treat as missing data
         if result["roe"] == 0 and result["gross_margin"] == 0 and result["eps_growth"] == 0:
             result["_data_missing"] = True
         return result
@@ -406,8 +384,6 @@ def get_fundamentals(ticker):
 def quality_score(fund):
     score, failed = 0.0, []
 
-    # v6: if data is missing, return a neutral passing score (30) with a note
-    # so Finnhub rate-limits don't silently kill valid setups
     if fund.get("_data_missing"):
         return 30.0, ["⚠ Finnhub data unavailable — using neutral score"]
 
@@ -466,11 +442,6 @@ def compute_indicators(df):
 
 
 def find_swing_points(df, lookback=90, min_bars=5, max_age_bars=40):
-    """
-    v6: max_age_bars raised from 20 → 40 (8 weeks instead of 4).
-    Wave 2 and Wave 4 setups often form over 6-12 weeks — the old
-    window was too tight and discarded valid patterns silently.
-    """
     n     = len(df)
     start = max(0, n - lookback)
     highs, lows = [], []
@@ -508,7 +479,6 @@ def detect_wave2_setup(df):
     price   = float(current["Close"])
     rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
 
-    # v6: max_age_bars=40 (was 20)
     highs, lows = find_swing_points(df, lookback=90, min_bars=5, max_age_bars=40)
     if len(highs) < 1 or len(lows) < 1:
         return None
@@ -585,7 +555,6 @@ def detect_wave4_setup(df):
     price   = float(current["Close"])
     rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
 
-    # v6: max_age_bars=40 (was 20)
     highs, lows = find_swing_points(df, lookback=120, min_bars=5, max_age_bars=40)
     if len(highs) < 2 or len(lows) < 1:
         return None
@@ -657,7 +626,6 @@ def detect_abc_setup(df):
     price   = float(current["Close"])
     rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
 
-    # v6: max_age_bars=40 (was 20)
     highs, lows = find_swing_points(df, lookback=90, min_bars=4, max_age_bars=40)
     if len(highs) < 1 or len(lows) < 2:
         return None
@@ -763,7 +731,6 @@ def analyze_ticker(ticker, seen=None):
         mark_seen(ticker, setup_name, price, seen)
 
         fund = get_fundamentals(ticker)
-        # fund is now always a valid dict (never {}) — _data_missing flag is set when Finnhub fails
 
         q_score, failed = quality_score(fund)
         if q_score < MIN_QUALITY_SCORE:
