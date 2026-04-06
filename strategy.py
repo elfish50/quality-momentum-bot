@@ -137,7 +137,7 @@ def _get_most_actives() -> list:
         r = requests.get(
             ALPACA_SCREEN_URL,
             headers=HEADERS,
-            params={"by": "volume", "top": 200},
+            params={"by": "volume", "top": 100},
             timeout=15
         )
         if not r.ok:
