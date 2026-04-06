@@ -4,9 +4,14 @@ Auto-executes BUY signals on Alpaca paper account
 """
 import asyncio
 import json
+import os
 import sys
 import traceback
 from datetime import datetime
+
+# ── Path fix: ensures local modules (positions, monitor, etc.) are always found
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.error import Conflict
@@ -51,6 +56,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/list - Show watchlist\n"
         "/scan_watchlist - Scan watchlist\n"
         "/positions - Open tracked positions\n"
+        "/universe - Show current scan universe\n"
         "/portfolio - Paper account P&L\n"
         "/trades - Recent trade history\n"
         "/cancel - Cancel all open orders\n"
@@ -129,8 +135,8 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Show all open tracked positions with entry, stop, and TP levels."""
-    from positions import format_open_positions
     try:
+        from positions import format_open_positions
         msg = format_open_positions()
         await update.message.reply_text(msg)
     except Exception:
@@ -238,13 +244,14 @@ async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_universe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    from strategy import get_universe
-    await update.message.reply_text("Fetching live universe from Finviz...")
+    """Show the current scan universe sourced from Alpaca (not Finviz)."""
+    await update.message.reply_text("Fetching universe from Alpaca...")
     try:
+        from universe import load_universe
         loop    = asyncio.get_event_loop()
-        tickers = await loop.run_in_executor(None, get_universe)
+        tickers = await loop.run_in_executor(None, load_universe)
         await update.message.reply_text(
-            f"Universe: {len(tickers):,} tickers (Finviz live screener)\n"
+            f"Universe: {len(tickers):,} tickers (Alpaca most-actives + assets)\n"
             f"Sample: {', '.join(tickers[:10])}"
         )
     except Exception:
@@ -258,7 +265,7 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Strategy:  Elliott Wave + Fibonacci\n"
         "Direction: LONG ONLY\n"
         "Timeframe: Daily bars\n"
-        "Universe:  Finviz live screener (~400 tickers)\n"
+        "Universe:  Alpaca most-actives + assets\n"
         "Data:      Alpaca + Finnhub\n"
         "Account:   $1k paper\n"
         "Risk:      $100/trade\n"
@@ -316,13 +323,12 @@ def main():
     )
 
     # ── Position monitor — every 5 min, market hours only ────────────────────
-    # monitor.py checks _is_market_open() internally so off-hours calls are no-ops
     scheduler.add_job(
         lambda: asyncio.run_coroutine_threadsafe(scheduled_monitor(bot_app.bot), loop),
         "cron",
         day_of_week="mon-fri",
-        hour="9-16",          # 9AM-4PM ET window (monitor skips if market closed)
-        minute="*/5",         # every 5 minutes
+        hour="9-16",
+        minute="*/5",
         id="monitor_5min"
     )
 
@@ -331,13 +337,15 @@ def main():
         loop = asyncio.get_event_loop()
         scheduler.start()
         await application.bot.delete_webhook(drop_pending_updates=True)
-        print("Scheduler started")
-        print("  Scans:   Mon-Fri 10AM, 12:30PM, 2:30PM ET")
-        print("  Monitor: Mon-Fri 9AM-4PM every 5 min (TP1 exits + stop tracking)")
-        print(f"  Next jobs: {[str(job.next_run_time) for job in scheduler.get_jobs()]}")
+        print("Quality Momentum Bot running!")
+        print("  Universe: Alpaca most-actives + assets")
+        print("  Scans:    Mon-Fri 10AM, 12:30PM, 2:30PM ET")
+        print("  Monitor:  Mon-Fri 9AM-4PM every 5 min (TP1 exits + stop tracking)")
+        next_jobs = [str(job.next_run_time) for job in scheduler.get_jobs()]
+        for j in next_jobs:
+            print(f"  Next: {j}")
 
     bot_app.post_init = on_startup
-    print("Quality Momentum Bot running!")
     bot_app.run_polling(drop_pending_updates=True)
 
 
