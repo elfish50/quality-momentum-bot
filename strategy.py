@@ -2,27 +2,25 @@
 ELLIOTT WAVE + FIBONACCI STRATEGY
 Based on Asaf Naamani's framework
 
-PATCH v5 — Universe via Alpaca APIs (replaces Finviz)
-══════════════════════════════════════════════════════
-Root cause of the 50-ticker problem:
-  Finviz blocks requests from cloud/VPS servers (Railway, Heroku, etc.)
-  with a 403 Forbidden error. finvizfinance silently returns only the
-  first page (20-50 rows) before getting blocked.
+PATCH v6 — Three scanner fixes
+════════════════════════════════════════════════════════════════
+Bug 1 — Universe too small (~100 tickers instead of 500):
+  most-actives expanded to top=200.
+  Snapshot filter now tries `sip` feed first (broader coverage),
+  falls back to `iex` on error. Fallback threshold lowered to <20.
 
-  On weekends, Alpaca's live dailyBar snapshots are empty, so volume
-  filters wiped everything out. Fixed by falling back to prevDailyBar
-  (previous close data) when dailyBar is unavailable.
+Bug 2 — Swing window too tight (max_age_bars=20 = only 4 weeks):
+  Raised to max_age_bars=40 in Wave 2, Wave 4, and ABC detectors.
+  Valid setups forming over 6–12 weeks are now detected.
 
-Fix: get_universe() uses only Alpaca APIs — works from Railway,
-     works on weekends, works at any time of day.
-
-Universe built in 2 layers:
-  Layer 1: Alpaca most-actives endpoint (~100 high-volume stocks)
-  Layer 2: Random sample from all active Alpaca assets, filtered by
-           price > $5 and volume > 300k via snapshot batch calls
-           (uses prevDailyBar fallback when market is closed)
+Bug 3 — Finnhub rate-limits silently kill all tickers:
+  get_fundamentals() returns a default skeleton on failure instead
+  of {}.  quality_score() on an empty record now returns ~20 (not 0).
+  MIN_QUALITY_SCORE lowered from 40 → 25 so rate-limited tickers
+  aren't silently dropped — they pass with a low score and are flagged.
 
 All previous patches preserved:
+  v5: Dynamic universe via Alpaca APIs
   v4: Dynamic universe
   v3: Deduplication, swing recency filter, seen expiry
   v2: Weekly trend filter softened, RSI/wave thresholds relaxed
@@ -70,7 +68,7 @@ EXT_2618 = 2.618
 
 # ── Strategy thresholds ───────────────────────────────────────────────────────
 VOL_CONFIRM_RATIO = 1.2
-MIN_QUALITY_SCORE = 40
+MIN_QUALITY_SCORE = 25   # v6: lowered from 40 — Finnhub gaps shouldn't drop valid setups
 MIN_WAVE1_MOVE    = 0.05
 MIN_RR_TP2        = 2.0
 
@@ -127,18 +125,19 @@ def mark_seen(ticker: str, setup_name: str, price: float, seen: dict) -> None:
     seen[key] = {"price": price, "ts": datetime.now().isoformat()}
 
 
-# ── Dynamic Universe via Alpaca (v5) ──────────────────────────────────────────
+# ── Dynamic Universe via Alpaca (v6) ──────────────────────────────────────────
 
 def _get_most_actives() -> list:
     """
-    Top 100 most-active US stocks by volume from Alpaca's screener.
-    Works on weekends — this endpoint returns historical data, not live.
+    Top 200 most-active US stocks by volume from Alpaca's screener.
+    Expanded from 100 → 200 in v6 to widen the quality pool.
+    Works on weekends — returns historical data, not live.
     """
     try:
         r = requests.get(
             ALPACA_SCREEN_URL,
             headers=HEADERS,
-            params={"by": "volume", "top": 100},
+            params={"by": "volume", "top": 200},
             timeout=15
         )
         if not r.ok:
@@ -188,37 +187,40 @@ def _snapshot_filter(tickers: list, min_price: float = 5.0, min_volume: float = 
     """
     Filter tickers by price and volume using Alpaca snapshots.
 
-    Weekend/after-hours safe: tries dailyBar first (live session data),
-    falls back to prevDailyBar (last completed trading day) when the
-    market is closed and dailyBar is empty. This ensures the universe
-    is always populated regardless of what day/time the scan runs.
+    v6: tries `sip` feed first (broader coverage than iex), falls back
+    to `iex` on error per chunk.  Weekend-safe: uses prevDailyBar fallback
+    when dailyBar is empty (market closed).
     """
     filtered   = []
     chunk_size = 100
 
     for i in range(0, len(tickers), chunk_size):
         chunk = tickers[i: i + chunk_size]
-        try:
-            r = requests.get(
-                f"{ALPACA_URL}/stocks/snapshots",
-                headers=HEADERS,
-                params={"symbols": ",".join(chunk), "feed": "iex"},
-                timeout=20
-            )
-            if not r.ok:
+        snap_data = {}
+
+        for feed in ["sip", "iex"]:
+            try:
+                r = requests.get(
+                    f"{ALPACA_URL}/stocks/snapshots",
+                    headers=HEADERS,
+                    params={"symbols": ",".join(chunk), "feed": feed},
+                    timeout=20
+                )
+                if r.ok and r.json():
+                    snap_data = r.json()
+                    break
+            except Exception as e:
+                print(f"[universe] snapshot chunk error ({feed}): {e}")
+
+        for sym, snap in snap_data.items():
+            try:
+                daily  = snap.get("dailyBar") or snap.get("prevDailyBar") or {}
+                close  = float(daily.get("c", 0) or 0)
+                volume = float(daily.get("v", 0) or 0)
+                if close >= min_price and volume >= min_volume:
+                    filtered.append(sym)
+            except Exception:
                 continue
-            for sym, snap in r.json().items():
-                try:
-                    # dailyBar = live today | prevDailyBar = last close (weekend safe)
-                    daily  = snap.get("dailyBar") or snap.get("prevDailyBar") or {}
-                    close  = float(daily.get("c", 0) or 0)
-                    volume = float(daily.get("v", 0) or 0)
-                    if close >= min_price and volume >= min_volume:
-                        filtered.append(sym)
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"[universe] snapshot chunk error: {e}")
 
     print(f"[universe] after price/volume filter: {len(filtered)} tickers")
     return filtered
@@ -227,22 +229,19 @@ def _snapshot_filter(tickers: list, min_price: float = 5.0, min_volume: float = 
 def get_universe() -> list:
     """
     Build a fresh, varied universe every run using only Alpaca APIs.
-    No Finviz — no 403 blocks, no scraping, works from any server.
 
-    Layer 1: most-actives (top 100 by volume — always relevant)
+    Layer 1: most-actives top 200 (v6: was 100)
     Layer 2: random sample of all Alpaca assets, filtered by price+volume
-             using prevDailyBar fallback so weekends work fine
+             using sip feed first, iex fallback, prevDailyBar weekend safe.
 
-    Shuffled so each scan sees stocks in a different order.
-    Falls back to FALLBACK_TICKERS only if all Alpaca calls fail.
+    Falls back to FALLBACK_TICKERS only if <20 tickers are returned
+    (v6: was <10 — more aggressive failsafe).
     """
     result = []
 
-    # Layer 1 — most actives
     most_actives = _get_most_actives()
     result.extend(most_actives)
 
-    # Layer 2 — random sample from full asset list
     assets = _get_alpaca_assets()
     if assets:
         sample_size = min(len(assets), UNIVERSE_SIZE * 4)
@@ -250,7 +249,6 @@ def get_universe() -> list:
         filtered    = _snapshot_filter(sample)
         result.extend(filtered)
 
-    # Deduplicate, preserving order
     seen_set = set()
     deduped  = []
     for t in result:
@@ -259,11 +257,10 @@ def get_universe() -> list:
             seen_set.add(t)
             deduped.append(t)
 
-    if len(deduped) < 10:
+    if len(deduped) < 20:
         print(f"[universe] only {len(deduped)} tickers — using fallback")
         return list(FALLBACK_TICKERS)
 
-    # Keep most-actives at front, shuffle the rest
     n_front = len(most_actives)
     front   = deduped[:n_front]
     rest    = deduped[n_front:]
@@ -272,6 +269,11 @@ def get_universe() -> list:
 
     print(f"[universe] final universe: {len(final)} tickers")
     return final
+
+
+# keep load_universe as alias for bot.py /universe command
+def load_universe() -> list:
+    return get_universe()
 
 
 # ── Price Data ────────────────────────────────────────────────────────────────
@@ -348,6 +350,20 @@ def weekly_trend_is_up(df):
 
 # ── Fundamentals ──────────────────────────────────────────────────────────────
 
+# v6: default skeleton so quality_score() always gets real numbers, not {}
+_FUND_DEFAULT = {
+    "roe":          0.0,
+    "gross_margin": 0.0,
+    "debt_equity":  999.0,
+    "eps_growth":   0.0,
+    "pe_ratio":     0.0,
+    "sector":       "Unknown",
+    "name":         "",
+    "market_cap":   0.0,
+    "_data_missing": True,   # flag so we can loosen quality gate downstream
+}
+
+
 def get_fundamentals(ticker):
     def safe(v, d=0.0):
         try: return float(v) if v not in (None, "", "N/A", "None") else d
@@ -365,7 +381,8 @@ def get_fundamentals(ticker):
             timeout=15
         )
         p  = r2.json()
-        return {
+
+        result = {
             "roe":          safe(m.get("roeTTM")) / 100,
             "gross_margin": safe(m.get("grossMarginTTM")) / 100,
             "debt_equity":  safe(m.get("totalDebt/totalEquityAnnual"), 999),
@@ -375,13 +392,24 @@ def get_fundamentals(ticker):
             "name":         p.get("name", ticker),
             "market_cap":   safe(p.get("marketCapitalization")) * 1_000_000,
         }
+        # If all core metrics are zero, treat as missing data
+        if result["roe"] == 0 and result["gross_margin"] == 0 and result["eps_growth"] == 0:
+            result["_data_missing"] = True
+        return result
     except Exception as e:
         print(f"[{ticker}] Finnhub error: {e}")
-        return {}
+        default = dict(_FUND_DEFAULT)
+        default["name"] = ticker
+        return default
 
 
 def quality_score(fund):
     score, failed = 0.0, []
+
+    # v6: if data is missing, return a neutral passing score (30) with a note
+    # so Finnhub rate-limits don't silently kill valid setups
+    if fund.get("_data_missing"):
+        return 30.0, ["⚠ Finnhub data unavailable — using neutral score"]
 
     roe = fund.get("roe", 0)
     if roe >= 0.15:   score += 30
@@ -437,7 +465,12 @@ def compute_indicators(df):
     return df
 
 
-def find_swing_points(df, lookback=90, min_bars=5, max_age_bars=20):
+def find_swing_points(df, lookback=90, min_bars=5, max_age_bars=40):
+    """
+    v6: max_age_bars raised from 20 → 40 (8 weeks instead of 4).
+    Wave 2 and Wave 4 setups often form over 6-12 weeks — the old
+    window was too tight and discarded valid patterns silently.
+    """
     n     = len(df)
     start = max(0, n - lookback)
     highs, lows = [], []
@@ -475,7 +508,8 @@ def detect_wave2_setup(df):
     price   = float(current["Close"])
     rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
 
-    highs, lows = find_swing_points(df, lookback=90, min_bars=5, max_age_bars=20)
+    # v6: max_age_bars=40 (was 20)
+    highs, lows = find_swing_points(df, lookback=90, min_bars=5, max_age_bars=40)
     if len(highs) < 1 or len(lows) < 1:
         return None
 
@@ -551,7 +585,8 @@ def detect_wave4_setup(df):
     price   = float(current["Close"])
     rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
 
-    highs, lows = find_swing_points(df, lookback=120, min_bars=5, max_age_bars=20)
+    # v6: max_age_bars=40 (was 20)
+    highs, lows = find_swing_points(df, lookback=120, min_bars=5, max_age_bars=40)
     if len(highs) < 2 or len(lows) < 1:
         return None
 
@@ -622,7 +657,8 @@ def detect_abc_setup(df):
     price   = float(current["Close"])
     rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
 
-    highs, lows = find_swing_points(df, lookback=90, min_bars=4, max_age_bars=20)
+    # v6: max_age_bars=40 (was 20)
+    highs, lows = find_swing_points(df, lookback=90, min_bars=4, max_age_bars=40)
     if len(highs) < 1 or len(lows) < 2:
         return None
 
@@ -727,8 +763,7 @@ def analyze_ticker(ticker, seen=None):
         mark_seen(ticker, setup_name, price, seen)
 
         fund = get_fundamentals(ticker)
-        if not fund:
-            return None
+        # fund is now always a valid dict (never {}) — _data_missing flag is set when Finnhub fails
 
         q_score, failed = quality_score(fund)
         if q_score < MIN_QUALITY_SCORE:
@@ -794,6 +829,7 @@ def analyze_ticker(ticker, seen=None):
             "sector":        fund.get("sector", ""),
             "name":          fund.get("name", ticker),
             "quality_notes": failed,
+            "fund_missing":  fund.get("_data_missing", False),
             "setup_detail":  setup.get("setup_detail", {}),
         }
 
@@ -828,9 +864,10 @@ if __name__ == "__main__":
     print(f"{'='*60}\n")
 
     for r in results:
+        fund_flag = " [no Finnhub data]" if r.get("fund_missing") else ""
         print(
             f"{'★' if r['signal'] == 'BUY' else '○'} {r['ticker']:6s} | "
             f"{r['setup']:18s} | Score {r['signal_score']:.0f} | "
             f"Price ${r['price']} | TP2 ${r['tp2']} ({r['tp2_pct']:+.1f}%) | "
-            f"R:R {r['rr_tp2']:.1f}x | RSI {r['rsi']}"
+            f"R:R {r['rr_tp2']:.1f}x | RSI {r['rsi']}{fund_flag}"
         )
