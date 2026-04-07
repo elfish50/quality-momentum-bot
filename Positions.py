@@ -13,26 +13,26 @@ Why this exists:
 
 Schema per position:
   {
-    "ticker":        "AAPL",
-    "seen_key":      "AAPL::Wave 2 Pullback",   # cleared on close
-    "entry":         182.50,
-    "shares":        5,
-    "stop":          178.20,
-    "tp1":           191.30,
-    "tp2":           197.80,
-    "tp3":           212.40,
-    "tp1_hit":       false,         # true after TP1 partial fill
-    "shares_at_tp1": 1,             # shares sold at TP1 (floor(shares/3))
-    "shares_remaining": 4,          # shares still open after TP1
-    "tp1_order_id":  "abc...",      # Alpaca order ID for TP1 limit
-    "tp2_order_id":  "def...",      # Alpaca order ID for TP2 limit
-    "stop_order_id": "ghi...",      # Alpaca order ID for stop loss
-    "bracket_id":    "xyz...",      # parent bracket order ID (if used)
-    "setup":         "Wave 2 Pullback",
-    "signal_score":  72.0,
-    "opened_at":     "2025-04-01T14:23:00",
-    "closed_at":     null,
-    "close_reason":  null,          # "TP1", "TP2", "STOP", "MANUAL"
+    "ticker":           "AAPL",
+    "seen_key":         "AAPL::Wave 2 Pullback",
+    "entry":            182.50,
+    "shares":           5,
+    "shares_at_tp1":    1,
+    "shares_remaining": 4,
+    "stop":             178.20,
+    "tp1":              191.30,
+    "tp2":              197.80,
+    "tp3":              212.40,
+    "tp1_hit":          false,
+    "tp1_order_id":     "abc...",
+    "tp2_order_id":     "def...",
+    "stop_order_id":    "ghi...",
+    "bracket_id":       "xyz...",
+    "setup":            "Wave 2 Pullback",
+    "signal_score":     72.0,
+    "opened_at":        "2025-04-01T14:23:00",
+    "closed_at":        null,
+    "close_reason":     null,
   }
 """
 
@@ -68,7 +68,7 @@ def add_position(sig: dict, result: dict) -> None:
     ticker = sig["ticker"]
 
     shares        = result["shares"]
-    shares_at_tp1 = max(1, shares // 3)   # sell 1/3 at TP1
+    shares_at_tp1 = max(1, shares // 3)
 
     data[ticker] = {
         "ticker":           ticker,
@@ -76,11 +76,11 @@ def add_position(sig: dict, result: dict) -> None:
         "entry":            result["entry"],
         "shares":           shares,
         "shares_at_tp1":    shares_at_tp1,
-        "shares_remaining": shares,        # updated after TP1 fill
+        "shares_remaining": shares,
         "stop":             result["stop"],
-        "tp1":              sig["tp1"],
-        "tp2":              result["tp2"],
-        "tp3":              sig["tp3"],
+        "tp1":              result.get("tp1", sig.get("tp1", 0)),
+        "tp2":              result.get("tp2", sig.get("tp2", 0)),
+        "tp3":              sig.get("tp3", 0),
         "tp1_hit":          False,
         "tp1_order_id":     result.get("tp1_order_id", ""),
         "tp2_order_id":     result.get("tp2_order_id", ""),
@@ -113,9 +113,9 @@ def mark_tp1_hit(ticker: str) -> None:
     data = _load()
     if ticker not in data:
         return
-    pos                       = data[ticker]
-    pos["tp1_hit"]            = True
-    pos["shares_remaining"]   = pos["shares"] - pos["shares_at_tp1"]
+    pos                     = data[ticker]
+    pos["tp1_hit"]          = True
+    pos["shares_remaining"] = pos["shares"] - pos["shares_at_tp1"]
     _save(data)
     print(f"[positions] TP1 hit recorded for {ticker} — {pos['shares_at_tp1']} shares sold")
 
@@ -123,7 +123,7 @@ def mark_tp1_hit(ticker: str) -> None:
 def mark_closed(ticker: str, reason: str) -> None:
     """
     Mark a position as closed.
-    reason: 'TP1', 'TP2', 'STOP', 'MANUAL'
+    reason: 'TP1', 'TP2', 'STOP', 'MANUAL', 'CLOSED'
     """
     data = _load()
     if ticker not in data:
@@ -143,16 +143,16 @@ def remove_position(ticker: str) -> None:
 
 
 def format_open_positions() -> str:
-    """Human-readable summary of all open positions for Telegram."""
+    """Human-readable summary of all open positions for Telegram /positions command."""
     positions = get_open_positions()
     if not positions:
-        return "No open tracked positions."
+        return "No open tracked positions.\n\nRun /portfolio to see Alpaca positions."
 
     lines = [f"{'='*38}", "OPEN POSITIONS", f"{'='*38}"]
     for ticker, pos in positions.items():
         tp1_tag = " [TP1 ✅]" if pos.get("tp1_hit") else ""
         lines += [
-            f"{ticker} | {pos['setup']}{tp1_tag}",
+            f"{ticker} | {pos.get('setup', 'backfill')}{tp1_tag}",
             f"  Entry:  ${pos['entry']:.2f}  |  Shares: {pos['shares']}",
             f"  Stop:   ${pos['stop']:.2f}",
             f"  TP1:    ${pos['tp1']:.2f}",
