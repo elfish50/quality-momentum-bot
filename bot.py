@@ -9,7 +9,6 @@ import sys
 import traceback
 from datetime import datetime
 
-# ── Path fix: ensures local modules (positions, monitor, etc.) are always found
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -23,7 +22,7 @@ from config import BOT_TOKEN, CHAT_ID
 async def error_handler(update, context):
     error = context.error
     if isinstance(error, Conflict):
-        print("WARNING: Conflict detected, ignoring - Railway will manage restarts.")
+        print("WARNING: Conflict detected, ignoring.")
         return
     print(f"Unhandled error: {error}")
     traceback.print_exc()
@@ -31,12 +30,12 @@ async def error_handler(update, context):
 
 async def scheduled_scan(bot):
     from scanner import run_universe_scan
-    print(f"Scan starting at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"[scan] Starting at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     await run_universe_scan(bot, CHAT_ID)
 
 
 async def scheduled_monitor(bot):
-    """Runs every 5 minutes during market hours — checks TP1, stop, and closes."""
+    """Runs 15 min after each scan so new positions are already recorded."""
     from monitor import run_monitor
     print(f"[monitor] Check at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     loop = asyncio.get_event_loop()
@@ -62,8 +61,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/cancel - Cancel all open orders\n"
         "/strategy - How it works\n"
         "/settings - Bot settings\n"
-        "Auto-scans: Mon-Fri 10AM, 12:30PM, 2:30PM ET\n"
-        "Monitor: every 5 min (TP1 exits + stop tracking)"
+        "Scans + monitor: Mon-Fri 10AM, 12:30PM, 2:30PM ET"
     )
 
 
@@ -244,7 +242,6 @@ async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_universe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show the current scan universe sourced from Alpaca (not Finviz)."""
     await update.message.reply_text("Fetching universe from Alpaca...")
     try:
         from universe import load_universe
@@ -272,7 +269,7 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "BUY:       volume confirmed (auto-executed)\n"
         "WATCH:     volume pending (alert only)\n"
         "Schedule:  Mon-Fri 10AM, 12:30PM, 2:30PM ET\n"
-        "Monitor:   every 5 min (TP1 exits + stops)"
+        "Monitor:   15 min after each scan (10:15, 12:45, 14:45)"
     )
 
 
@@ -304,46 +301,46 @@ def main():
     bot_app.add_handler(CommandHandler("trades",         cmd_trades))
     bot_app.add_handler(CommandHandler("cancel",         cmd_cancel))
 
-    loop = None
-
     scheduler = AsyncIOScheduler(timezone="America/New_York")
 
-    # ── Scans ─────────────────────────────────────────────────────────────────
+    # ── 10:00 AM scan → 10:15 AM monitor ─────────────────────────────────────
     scheduler.add_job(
-        lambda: asyncio.run_coroutine_threadsafe(scheduled_scan(bot_app.bot), loop),
-        "cron", day_of_week="mon-fri", hour="10", minute="0", id="scan_10am"
+        lambda: asyncio.ensure_future(scheduled_scan(bot_app.bot)),
+        "cron", day_of_week="mon-fri", hour=10, minute=0, id="scan_10am"
     )
     scheduler.add_job(
-        lambda: asyncio.run_coroutine_threadsafe(scheduled_scan(bot_app.bot), loop),
-        "cron", day_of_week="mon-fri", hour="12", minute="30", id="scan_1230pm"
-    )
-    scheduler.add_job(
-        lambda: asyncio.run_coroutine_threadsafe(scheduled_scan(bot_app.bot), loop),
-        "cron", day_of_week="mon-fri", hour="14", minute="30", id="scan_230pm"
+        lambda: asyncio.ensure_future(scheduled_monitor(bot_app.bot)),
+        "cron", day_of_week="mon-fri", hour=10, minute=15, id="monitor_10am"
     )
 
-    # ── Position monitor — every 5 min, market hours only ────────────────────
+    # ── 12:30 PM scan → 12:45 PM monitor ─────────────────────────────────────
     scheduler.add_job(
-        lambda: asyncio.run_coroutine_threadsafe(scheduled_monitor(bot_app.bot), loop),
-        "cron",
-        day_of_week="mon-fri",
-        hour="9-16",
-        minute="*/5",
-        id="monitor_5min"
+        lambda: asyncio.ensure_future(scheduled_scan(bot_app.bot)),
+        "cron", day_of_week="mon-fri", hour=12, minute=30, id="scan_1230pm"
+    )
+    scheduler.add_job(
+        lambda: asyncio.ensure_future(scheduled_monitor(bot_app.bot)),
+        "cron", day_of_week="mon-fri", hour=12, minute=45, id="monitor_1230pm"
+    )
+
+    # ── 2:30 PM scan → 2:45 PM monitor ───────────────────────────────────────
+    scheduler.add_job(
+        lambda: asyncio.ensure_future(scheduled_scan(bot_app.bot)),
+        "cron", day_of_week="mon-fri", hour=14, minute=30, id="scan_230pm"
+    )
+    scheduler.add_job(
+        lambda: asyncio.ensure_future(scheduled_monitor(bot_app.bot)),
+        "cron", day_of_week="mon-fri", hour=14, minute=45, id="monitor_230pm"
     )
 
     async def on_startup(application):
-        nonlocal loop
-        loop = asyncio.get_event_loop()
         scheduler.start()
         await application.bot.delete_webhook(drop_pending_updates=True)
         print("Quality Momentum Bot running!")
-        print("  Universe: Alpaca most-actives + assets")
-        print("  Scans:    Mon-Fri 10AM, 12:30PM, 2:30PM ET")
-        print("  Monitor:  Mon-Fri 9AM-4PM every 5 min (TP1 exits + stop tracking)")
-        next_jobs = [str(job.next_run_time) for job in scheduler.get_jobs()]
-        for j in next_jobs:
-            print(f"  Next: {j}")
+        print("  Scans:   Mon-Fri 10:00, 12:30, 14:30 ET")
+        print("  Monitor: Mon-Fri 10:15, 12:45, 14:45 ET")
+        for job in scheduler.get_jobs():
+            print(f"  Job: {job.id} → next {job.next_run_time}")
 
     bot_app.post_init = on_startup
     bot_app.run_polling(drop_pending_updates=True)
