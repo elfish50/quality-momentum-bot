@@ -2,24 +2,17 @@
 ELLIOTT WAVE + FIBONACCI STRATEGY
 Based on Asaf Naamani's framework
 
-PATCH v6 — Three scanner fixes
+PATCH v7 — Finnhub fix + debug logging
 ════════════════════════════════════════════════════════════════
-Bug 1 — Universe too small (~100 tickers instead of 500):
-  most-actives expanded to top=200.
-  Snapshot filter now tries `sip` feed first (broader coverage),
-  falls back to `iex` on error. Fallback threshold lowered to <20.
-
-Bug 2 — Swing window too tight (max_age_bars=20 = only 4 weeks):
-  Raised to max_age_bars=40 in Wave 2, Wave 4, and ABC detectors.
-  Valid setups forming over 6–12 weeks are now detected.
-
-Bug 3 — Finnhub rate-limits silently kill all tickers:
-  get_fundamentals() returns a default skeleton on failure instead
-  of {}.  quality_score() on an empty record now returns ~20 (not 0).
-  MIN_QUALITY_SCORE lowered from 40 → 25 so rate-limited tickers
-  aren't silently dropped — they pass with a low score and are flagged.
+Bug fix — Finnhub returning all zeros:
+  - Added explicit status code check and response logging
+  - Retry on 429 rate limit with backoff
+  - Fixed _data_missing detection (was checking post-division values)
+  - Added FINNHUB_KEY presence check at startup
+  - get_fundamentals() now logs what it actually receives
 
 All previous patches preserved:
+  v6: Universe size, swing window, quality threshold
   v5: Dynamic universe via Alpaca APIs
   v4: Dynamic universe
   v3: Deduplication, swing recency filter, seen expiry
@@ -31,6 +24,7 @@ import json
 import math
 import pathlib
 import random
+import time
 import traceback
 import pandas as pd
 import numpy as np
@@ -41,6 +35,12 @@ from datetime import datetime, timedelta
 ALPACA_KEY    = os.getenv("ALPACA_KEY", "")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET", "")
 FINNHUB_KEY   = os.getenv("FINNHUB_KEY", "")
+
+# Warn loudly at import time so Railway logs make it obvious
+if not FINNHUB_KEY:
+    print("[strategy] WARNING: FINNHUB_KEY is not set — fundamentals will always be missing")
+else:
+    print(f"[strategy] FINNHUB_KEY present (starts with: {FINNHUB_KEY[:4]}...)")
 
 ALPACA_URL        = "https://data.alpaca.markets/v2"
 ALPACA_SCREEN_URL = "https://data.alpaca.markets/v1beta1/screener/stocks/most-actives"
@@ -152,15 +152,12 @@ def _get_most_actives() -> list:
 def _get_alpaca_assets() -> list:
     """All active tradable US equity assets from Alpaca (~8000+ symbols)."""
     try:
-        print(f"[universe] assets URL: {ALPACA_ASSETS_URL}")
-        print(f"[universe] key present: {bool(ALPACA_KEY)}, secret present: {bool(ALPACA_SECRET)}")
         r = requests.get(
             ALPACA_ASSETS_URL,
             headers=HEADERS,
             params={"status": "active", "asset_class": "us_equity"},
             timeout=30
         )
-        print(f"[universe] assets response {r.status_code}: {r.text[:200]}")
         if not r.ok:
             print(f"[universe] assets error {r.status_code}")
             return []
@@ -342,46 +339,127 @@ _FUND_DEFAULT = {
     "_data_missing": True,
 }
 
+# Finnhub free tier: 60 calls/min. With 2 calls per ticker that's ~30 tickers/min.
+# Add a small delay between tickers to avoid 429s across the scan loop.
+_FINNHUB_CALL_DELAY = 1.2  # seconds between the two Finnhub calls per ticker
 
-def get_fundamentals(ticker):
+
+def _finnhub_get(url: str, params: dict, ticker: str, label: str) -> dict:
+    """
+    Single Finnhub GET with retry on 429 and detailed logging.
+    Returns parsed JSON dict, or {} on failure.
+    """
+    for attempt in range(3):
+        try:
+            r = requests.get(url, params=params, timeout=15)
+
+            if r.status_code == 429:
+                wait = 15 * (attempt + 1)
+                print(f"[{ticker}] Finnhub {label} rate-limited (429) — waiting {wait}s")
+                time.sleep(wait)
+                continue
+
+            if r.status_code == 401:
+                print(f"[{ticker}] Finnhub {label} UNAUTHORIZED (401) — check FINNHUB_KEY")
+                return {}
+
+            if not r.ok:
+                print(f"[{ticker}] Finnhub {label} error {r.status_code}: {r.text[:120]}")
+                return {}
+
+            data = r.json()
+            return data
+
+        except Exception as e:
+            print(f"[{ticker}] Finnhub {label} exception (attempt {attempt+1}): {e}")
+            time.sleep(2)
+
+    return {}
+
+
+def get_fundamentals(ticker: str) -> dict:
     def safe(v, d=0.0):
-        try: return float(v) if v not in (None, "", "N/A", "None") else d
-        except: return d
+        try:
+            return float(v) if v not in (None, "", "N/A", "None") else d
+        except Exception:
+            return d
+
+    if not FINNHUB_KEY:
+        default = dict(_FUND_DEFAULT)
+        default["name"] = ticker
+        return default
+
     try:
-        r1 = requests.get(
+        metric_data = _finnhub_get(
             f"{FINNHUB_URL}/stock/metric",
-            params={"symbol": ticker, "metric": "all", "token": FINNHUB_KEY},
-            timeout=15
+            {"symbol": ticker, "metric": "all", "token": FINNHUB_KEY},
+            ticker, "metric"
         )
-        m  = r1.json().get("metric", {})
-        r2 = requests.get(
+        time.sleep(_FINNHUB_CALL_DELAY)
+
+        profile_data = _finnhub_get(
             f"{FINNHUB_URL}/stock/profile2",
-            params={"symbol": ticker, "token": FINNHUB_KEY},
-            timeout=15
+            {"symbol": ticker, "token": FINNHUB_KEY},
+            ticker, "profile"
         )
-        p  = r2.json()
+
+        m = metric_data.get("metric", {})
+        p = profile_data  # profile2 returns flat dict
+
+        # Raw values from API (before any division)
+        raw_roe    = m.get("roeTTM")
+        raw_gm     = m.get("grossMarginTTM")
+        raw_eps    = m.get("epsGrowth3Y")
+        raw_de     = m.get("totalDebt/totalEquityAnnual")
+        raw_pe     = m.get("peNormalizedAnnual")
+
+        # Log what we got so Railway logs are informative
+        print(
+            f"[{ticker}] Finnhub raw — "
+            f"ROE:{raw_roe} GM:{raw_gm} EPS:{raw_eps} "
+            f"D/E:{raw_de} PE:{raw_pe} "
+            f"sector:{p.get('finnhubIndustry')} name:{p.get('name')}"
+        )
+
+        roe_val    = safe(raw_roe) / 100.0
+        gm_val     = safe(raw_gm)  / 100.0
+        eps_val    = safe(raw_eps) / 100.0
+        de_val     = safe(raw_de, 999.0)
+        pe_val     = safe(raw_pe)
+
+        # Detect missing data: ALL numeric fields are zero/default AND
+        # the metric dict itself is empty or nearly empty
+        numeric_empty = (
+            raw_roe in (None, "", "N/A", "None") and
+            raw_gm  in (None, "", "N/A", "None") and
+            raw_eps in (None, "", "N/A", "None")
+        )
+        data_missing = numeric_empty or len(m) < 3
+
+        if data_missing:
+            print(f"[{ticker}] Finnhub metric dict empty (len={len(m)}) — marking _data_missing")
 
         result = {
-            "roe":          safe(m.get("roeTTM")) / 100,
-            "gross_margin": safe(m.get("grossMarginTTM")) / 100,
-            "debt_equity":  safe(m.get("totalDebt/totalEquityAnnual"), 999),
-            "eps_growth":   safe(m.get("epsGrowth3Y")) / 100,
-            "pe_ratio":     safe(m.get("peNormalizedAnnual")),
-            "sector":       p.get("finnhubIndustry", "Unknown"),
-            "name":         p.get("name", ticker),
-            "market_cap":   safe(p.get("marketCapitalization")) * 1_000_000,
+            "roe":           roe_val,
+            "gross_margin":  gm_val,
+            "debt_equity":   de_val,
+            "eps_growth":    eps_val,
+            "pe_ratio":      pe_val,
+            "sector":        p.get("finnhubIndustry", "Unknown"),
+            "name":          p.get("name", ticker),
+            "market_cap":    safe(p.get("marketCapitalization")) * 1_000_000,
+            "_data_missing": data_missing,
         }
-        if result["roe"] == 0 and result["gross_margin"] == 0 and result["eps_growth"] == 0:
-            result["_data_missing"] = True
         return result
+
     except Exception as e:
-        print(f"[{ticker}] Finnhub error: {e}")
+        print(f"[{ticker}] Finnhub get_fundamentals exception: {e}")
         default = dict(_FUND_DEFAULT)
         default["name"] = ticker
         return default
 
 
-def quality_score(fund):
+def quality_score(fund: dict):
     score, failed = 0.0, []
 
     if fund.get("_data_missing"):
