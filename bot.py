@@ -18,6 +18,9 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
 from config import BOT_TOKEN, CHAT_ID
 
+# Global reference so scheduler jobs can reach the bot
+_bot_app = None
+
 
 async def error_handler(update, context):
     error = context.error
@@ -28,19 +31,22 @@ async def error_handler(update, context):
     traceback.print_exc()
 
 
-async def scheduled_scan(bot):
+# ── Scheduler job functions (true async, no lambdas) ─────────────────────────
+
+async def scheduled_scan():
     from scanner import run_universe_scan
     print(f"[scan] Starting at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    await run_universe_scan(bot, CHAT_ID)
+    await run_universe_scan(_bot_app.bot, CHAT_ID)
 
 
-async def scheduled_monitor(bot):
-    """Runs 15 min after each scan so new positions are already recorded."""
+async def scheduled_monitor():
     from monitor import run_monitor
     print(f"[monitor] Check at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, lambda: run_monitor(bot=bot, chat_id=CHAT_ID))
+    await loop.run_in_executor(None, lambda: run_monitor(bot=_bot_app.bot, chat_id=CHAT_ID))
 
+
+# ── Command handlers ──────────────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -132,7 +138,6 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show all open tracked positions with entry, stop, and TP levels."""
     try:
         from positions import format_open_positions
         msg = format_open_positions()
@@ -273,7 +278,11 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
+    global _bot_app
+
     request = HTTPXRequest(
         connection_pool_size=8,
         connect_timeout=30.0,
@@ -282,6 +291,7 @@ def main():
         pool_timeout=30.0,
     )
     bot_app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
+    _bot_app = bot_app
 
     bot_app.add_error_handler(error_handler)
 
@@ -301,35 +311,38 @@ def main():
     bot_app.add_handler(CommandHandler("trades",         cmd_trades))
     bot_app.add_handler(CommandHandler("cancel",         cmd_cancel))
 
+    # AsyncIOScheduler runs coroutines natively — pass async def directly,
+    # no lambda wrapping needed. The scheduler shares the same event loop
+    # as run_polling, so coroutine dispatch is reliable.
     scheduler = AsyncIOScheduler(timezone="America/New_York")
 
     # ── 10:00 AM scan → 10:15 AM monitor ─────────────────────────────────────
     scheduler.add_job(
-        lambda: asyncio.ensure_future(scheduled_scan(bot_app.bot)),
+        scheduled_scan,
         "cron", day_of_week="mon-fri", hour=10, minute=0, id="scan_10am"
     )
     scheduler.add_job(
-        lambda: asyncio.ensure_future(scheduled_monitor(bot_app.bot)),
+        scheduled_monitor,
         "cron", day_of_week="mon-fri", hour=10, minute=15, id="monitor_10am"
     )
 
     # ── 12:30 PM scan → 12:45 PM monitor ─────────────────────────────────────
     scheduler.add_job(
-        lambda: asyncio.ensure_future(scheduled_scan(bot_app.bot)),
+        scheduled_scan,
         "cron", day_of_week="mon-fri", hour=12, minute=30, id="scan_1230pm"
     )
     scheduler.add_job(
-        lambda: asyncio.ensure_future(scheduled_monitor(bot_app.bot)),
+        scheduled_monitor,
         "cron", day_of_week="mon-fri", hour=12, minute=45, id="monitor_1230pm"
     )
 
     # ── 2:30 PM scan → 2:45 PM monitor ───────────────────────────────────────
     scheduler.add_job(
-        lambda: asyncio.ensure_future(scheduled_scan(bot_app.bot)),
+        scheduled_scan,
         "cron", day_of_week="mon-fri", hour=14, minute=30, id="scan_230pm"
     )
     scheduler.add_job(
-        lambda: asyncio.ensure_future(scheduled_monitor(bot_app.bot)),
+        scheduled_monitor,
         "cron", day_of_week="mon-fri", hour=14, minute=45, id="monitor_230pm"
     )
 
