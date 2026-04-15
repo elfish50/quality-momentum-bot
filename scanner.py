@@ -1,251 +1,175 @@
 """
-scanner.py - Elliott Wave + Fibonacci Scanner
-Berkshire Quality Screen + Wave 2 / Wave 4 / ABC setups
-LONG ONLY | Daily bars
-BUY = volume confirmed + auto-executed | WATCH = waiting for volume
+scanner.py — Universe Scan + Alert Formatting
 
-v4 fix: universe now comes from strategy.get_universe() (Finviz live screener)
-instead of the old static load_universe() / get_all_tickers() lists.
-Deduplication (seen dict) is shared across the full scan loop so the same
-setup is never re-alerted within SEEN_EXPIRY_DAYS days.
+Runs analyze_ticker() across the full universe, formats alerts,
+and auto-executes BUY and SHORT signals via trader.py.
 """
-import gc
-import time
+
 import asyncio
 import traceback
 from datetime import datetime
 
-from strategy import analyze_ticker, get_universe, load_seen, save_seen
-
-BATCH_SIZE  = 10
-BATCH_DELAY = 1
-MAX_STOCKS  = 500
-
-
-def run_scan(tickers=None):
-    start = time.time()
-
-    if not tickers:
-        tickers = get_universe()          # <-- Finviz live screener, fresh every run
-
-    tickers = tickers[:MAX_STOCKS]
-    alerts  = []
-
-    # Load seen once for the whole scan — deduplication across all tickers
-    seen = load_seen()
-
-    print(f"Scanning {len(tickers)} tickers...")
-
-    for i, ticker in enumerate(tickers):
-        try:
-            sig = analyze_ticker(ticker, seen)   # pass shared seen dict
-            if sig:
-                alerts.append(sig)
-                print(
-                    f"[{sig['signal']}] {ticker} | {sig['setup']} | "
-                    f"Score {sig['signal_score']} | "
-                    f"R:R TP2 {sig['rr_tp2']:.1f}x | "
-                    f"Vol {sig['vol_ratio']:.1f}x"
-                )
-        except Exception:
-            pass
-        finally:
-            gc.collect()
-
-        if (i + 1) % BATCH_SIZE == 0:
-            print(f"Progress: {i+1}/{len(tickers)} | Alerts: {len(alerts)}")
-            time.sleep(BATCH_DELAY)
-
-    # Save deduplication state once after the full scan
-    save_seen(seen)
-
-    alerts.sort(key=lambda x: x["signal_score"], reverse=True)
-    elapsed = time.time() - start
-    print(f"Scan done: {len(alerts)} alerts in {elapsed:.0f}s")
-    return alerts, elapsed
+from strategy import (
+    analyze_ticker,
+    get_universe,
+    load_seen,
+    save_seen,
+)
 
 
-def format_alert(sig):
-    vol_note = "Volume confirmed" if sig.get("vol_confirmed") else "Low volume -- WATCH only"
-    d        = sig.get("setup_detail", {})
-    label    = sig["signal"]
+# ── Alert Formatting ──────────────────────────────────────────────────────────
+
+def format_alert(sig: dict) -> str:
+    direction = sig.get("direction", "LONG")
+    signal    = sig.get("signal", "WATCH")
+    trend     = sig.get("trend", "neutral")
+
+    if signal == "BUY":
+        header = "🟢 BUY — AUTO-EXECUTING"
+    elif signal == "SHORT":
+        header = "🔴 SHORT — AUTO-EXECUTING"
+    else:
+        header = "👀 WATCH — Waiting for volume"
+
+    dir_arrow = "▲" if direction == "LONG" else "▼"
+    trend_map = {"up": "📈 Up", "down": "📉 Down", "neutral": "➡️ Neutral"}
+    trend_str = trend_map.get(trend, trend)
+
+    # TP direction label
+    tp_dir = "+" if direction == "LONG" else "-"
 
     lines = [
-        f"{'='*38}",
-        f"{label} {sig['ticker']} -- {sig['name']}",
-        f"{'='*38}",
-        f"Setup:    {sig['setup']}",
-        f"Signal:   {sig['signal_score']:.0f}/100 | Quality: {sig['quality_score']:.0f}/100",
+        f"{header}",
+        f"",
+        f"{'─'*30}",
+        f"📊 {sig['ticker']} — {sig['setup']}",
+        f"{'─'*30}",
+        f"Direction: {dir_arrow} {direction}  |  Trend: {trend_str}",
+        f"Score:    {sig['signal_score']:.0f}/100  |  Quality: {sig['quality_score']:.0f}",
+        f"",
+        f"Price:    ${sig['price']:.2f}",
+        f"RSI:      {sig['rsi']:.1f}  |  ATR: ${sig['atr']:.2f}",
+        f"Volume:   {sig['vol_ratio']:.1f}x avg {'✅' if sig['vol_confirmed'] else '⏳'}",
+        f"",
+        f"Stop:     ${sig['stop']:.2f}  (risk ${sig['risk_dollars']:.0f})",
+        f"TP1:      ${sig['tp1']:.2f}  ({tp_dir}{abs(sig['tp1_pct']):.1f}%)  R:R {sig['rr_tp1']:.1f}x",
+        f"TP2:      ${sig['tp2']:.2f}  ({tp_dir}{abs(sig['tp2_pct']):.1f}%)  R:R {sig['rr_tp2']:.1f}x",
+        f"TP3:      ${sig['tp3']:.2f}  ({tp_dir}{abs(sig['tp3_pct']):.1f}%)  stretch",
+        f"",
+        f"Sizing:   {sig['shares']} shares  (${sig['position_val']:.0f} / {sig['pct_account']:.0f}% acct)",
         f"Hold:     {sig['hold_time']}",
-        f"Sector:   {sig['sector']}",
     ]
 
-    if label == "WATCH":
-        lines.append(f"** Volume {sig['vol_ratio']:.1f}x -- wait for volume before entering **")
-
-    lines += [
-        f"",
-        f"--- Elliott Wave Analysis ---",
-    ]
-
-    if sig["setup"] == "Wave 2 Pullback":
+    # Fundamentals block
+    if not sig.get("fund_missing"):
         lines += [
-            f"Wave 1 origin: ${d.get('wave1_origin', 0):.2f}",
-            f"Wave 1 top:    ${d.get('wave1_top', 0):.2f}",
-            f"Wave 1 size:   ${d.get('wave1_size', 0):.2f}",
-            f"Fib 38.2%:     ${d.get('fib_382', 0):.2f}",
-            f"Fib 50.0%:     ${d.get('fib_500', 0):.2f}  <-- reversal zone",
-            f"Fib 61.8%:     ${d.get('fib_618', 0):.2f}  <-- reversal zone",
+            f"",
+            f"--- Fundamentals ---",
+            f"ROE:      {sig['roe']:.1f}%  |  Margin: {sig['gross_margin']:.1f}%",
+            f"EPS Grw:  {sig['eps_growth']:.1f}%  |  D/E: {sig['debt_equity']:.1f}x",
         ]
-    elif sig["setup"] == "Wave 4 Pullback":
-        lines += [
-            f"Wave 1 origin: ${d.get('wave1_origin', 0):.2f}",
-            f"Wave 1 high:   ${d.get('wave1_high', 0):.2f}  <-- stop zone",
-            f"Wave 3 high:   ${d.get('wave3_high', 0):.2f}",
-            f"Fib 38.2%:     ${d.get('fib_382', 0):.2f}  <-- entry zone",
-            f"Fib 50.0%:     ${d.get('fib_500', 0):.2f}",
-        ]
-    elif sig["setup"] == "ABC Correction":
-        lines += [
-            f"Wave A start:  ${d.get('wave_a_start', 0):.2f}",
-            f"Wave A end:    ${d.get('wave_a_end', 0):.2f}",
-            f"Wave C low:    ${d.get('wave_c_low', 0):.2f}  <-- correction end",
-        ]
+        if sig.get("quality_notes"):
+            lines.append(f"Warnings: {', '.join(sig['quality_notes'])}")
+    else:
+        lines.append(f"")
+        lines.append(f"⚠ Fundamentals unavailable")
 
-    lines += [
-        f"",
-        f"--- Price & Momentum ---",
-        f"Current price: ${sig['price']:.2f}",
-        f"RSI(14):       {sig['rsi']:.1f}",
-        f"Volume:        {sig['vol_ratio']:.1f}x avg -- {vol_note}",
-        f"",
-        f"--- Trade Setup (LONG) ---",
-        f"Entry:  ${sig['price']:.2f}",
-        f"Stop:   ${sig['stop']:.2f}  (invalidation level)",
-        f"",
-        f"--- Fibonacci Targets ---",
-        f"TP1 (1.272x): ${sig['tp1']:.2f}  (+{sig['tp1_pct']:.1f}%)  R:R {sig['rr_tp1']:.2f}x",
-        f"TP2 (1.618x): ${sig['tp2']:.2f}  (+{sig['tp2_pct']:.1f}%)  R:R {sig['rr_tp2']:.2f}x",
-        f"TP3 (2.618x): ${sig['tp3']:.2f}  (+{sig['tp3_pct']:.1f}%)  stretch target",
-        f"",
-        f"--- Quality Screen ---",
-        f"ROE:          {sig['roe']:.1f}%",
-        f"Gross Margin: {sig['gross_margin']:.1f}%",
-        f"EPS Growth:   {sig['eps_growth']:+.1f}%",
-        f"Debt/Equity:  {sig['debt_equity']:.2f}",
-        f"P/E Ratio:    {sig['pe_ratio']:.1f}x",
-    ]
+    if sig.get("sector"):
+        lines.append(f"Sector:   {sig['sector']}")
 
-    if sig.get("quality_notes"):
-        lines.append(f"Warnings: {', '.join(sig['quality_notes'])}")
-
-    lines += [
-        f"",
-        f"--- Position ($1k account, 10% risk) ---",
-        f"Shares:   {sig['shares']}",
-        f"Value:    ${sig['position_val']:,.0f} ({sig['pct_account']:.1f}% of $1k)",
-        f"Max loss: ${sig['risk_dollars']:.0f}",
-        f"{'='*38}",
-    ]
     return "\n".join(lines)
 
 
-def format_summary(alerts, elapsed, universe_size):
-    ts    = datetime.now().strftime("%Y-%m-%d %H:%M")
-    w2    = [a for a in alerts if a["setup"] == "Wave 2 Pullback"]
-    w4    = [a for a in alerts if a["setup"] == "Wave 4 Pullback"]
-    ab    = [a for a in alerts if a["setup"] == "ABC Correction"]
-    buys  = [a for a in alerts if a["signal"] == "BUY"]
-    watch = [a for a in alerts if a["signal"] == "WATCH"]
+# ── Universe Scan ─────────────────────────────────────────────────────────────
 
-    msg = (
-        f"Elliott Wave + Fib Scan -- {ts}\n"
-        f"{'='*36}\n"
-        f"Scanned:       {universe_size:,} tickers\n"
-        f"Duration:      {elapsed:.0f}s\n"
-        f"BUY signals:   {len(buys)}  (volume confirmed)\n"
-        f"WATCH signals: {len(watch)}  (waiting for volume)\n"
-        f"Wave 2 setups: {len(w2)}\n"
-        f"Wave 4 setups: {len(w4)}\n"
-        f"ABC setups:    {len(ab)}\n"
-        f"Total:         {len(alerts)}\n"
-        f"{'='*36}\n"
-        f"Strategy: Elliott Wave + Fibonacci\n"
-        f"Direction: LONG ONLY\n"
-        f"Timeframe: Daily bars\n"
-        f"Quality: Berkshire screen\n"
-    )
+def run_scan(tickers: list = None) -> list:
+    """
+    Synchronous scan over tickers list (or full universe if None).
+    Returns list of signal dicts sorted by signal_score descending.
+    """
+    if tickers is None:
+        tickers = get_universe()
 
-    if buys:
-        msg += f"\nTop BUY signals (auto-executed):\n"
-        for a in buys[:5]:
-            msg += f"  {a['ticker']} | {a['setup']} | Score {a['signal_score']:.0f} | R:R {a['rr_tp2']:.1f}x | +{a['tp2_pct']:.1f}%\n"
+    print(f"[scanner] Starting scan — {len(tickers)} tickers")
+    seen    = load_seen()
+    results = []
 
-    if watch:
-        msg += f"\nTop WATCH signals (wait for volume):\n"
-        for a in watch[:5]:
-            msg += f"  {a['ticker']} | {a['setup']} | Score {a['signal_score']:.0f} | Vol {a['vol_ratio']:.1f}x | +{a['tp2_pct']:.1f}%\n"
+    for ticker in tickers:
+        try:
+            result = analyze_ticker(ticker, seen)
+            if result:
+                results.append(result)
+                print(
+                    f"[scanner] ✅ {ticker} — {result['signal']} {result['setup']} "
+                    f"score:{result['signal_score']:.0f}"
+                )
+        except Exception:
+            print(f"[scanner] ERROR {ticker}: {traceback.format_exc()[-200:]}")
 
-    return msg
+    save_seen(seen)
+    results.sort(key=lambda x: x["signal_score"], reverse=True)
+    print(f"[scanner] Done — {len(results)} signal(s) found")
+    return results
 
 
-async def run_universe_scan(bot, chat_id, tickers=None):
-    if tickers:
-        scan_list     = tickers
-        universe_size = len(tickers)
-    else:
-        scan_list     = get_universe()        # <-- Finviz live screener
-        universe_size = len(scan_list)
-
-    await bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"Elliott Wave + Fibonacci Scan starting...\n"
-            f"Scanning {universe_size} tickers\n"
-            f"Looking for: Wave 2, Wave 4, ABC setups\n"
-            f"LONG ONLY | Daily bars\n"
-            f"Est. time: ~{universe_size // 60 + 1} min"
-        )
-    )
+async def run_universe_scan(bot, chat_id: str, tickers: list = None):
+    """
+    Async wrapper called by the scheduler and /scan command.
+    Runs the blocking scan in an executor, then sends alerts and executes trades.
+    """
+    loop = asyncio.get_event_loop()
 
     try:
-        loop            = asyncio.get_event_loop()
-        alerts, elapsed = await loop.run_in_executor(
-            None, lambda: run_scan(scan_list)
+        alerts = await loop.run_in_executor(
+            None,
+            lambda: run_scan(tickers)
         )
     except Exception:
         await bot.send_message(
             chat_id=chat_id,
-            text=f"Scan error:\n{traceback.format_exc()[-500:]}"
+            text=f"Scan error:\n{traceback.format_exc()[-400:]}"
         )
         return
-
-    summary = format_summary(alerts, elapsed, universe_size)
-    await bot.send_message(chat_id=chat_id, text=summary)
 
     if not alerts:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="No Elliott Wave setups found today.\nTry again tomorrow or use /check TICKER."
-        )
+        ts = datetime.now().strftime("%H:%M")
+        await bot.send_message(chat_id=chat_id, text=f"[{ts}] Scan complete — no setups found.")
         return
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"📡 Scan complete — {len(alerts)} setup(s) found:"
+    )
 
     for sig in alerts:
         try:
             await bot.send_message(chat_id=chat_id, text=format_alert(sig))
             await asyncio.sleep(0.3)
 
-            # Auto-execute BUY signals on paper account
-            if sig["signal"] == "BUY":
+            # Auto-execute BUY and SHORT signals
+            if sig["signal"] in ("BUY", "SHORT"):
                 try:
                     from trader import execute_signal, format_execution_result
-                    result = await loop.run_in_executor(None, lambda s=sig: execute_signal(s))
-                    await bot.send_message(chat_id=chat_id, text=format_execution_result(result, sig))
+                    from positions import add_position
+
+                    result = await loop.run_in_executor(
+                        None, lambda s=sig: execute_signal(s)
+                    )
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=format_execution_result(result, sig)
+                    )
+
+                    # Persist to open_positions.json so monitor.py can track it
+                    if result.get("success"):
+                        add_position(sig, result)
+
                 except Exception:
                     await bot.send_message(
                         chat_id=chat_id,
-                        text=f"Trade execution error for {sig['ticker']}:\n{traceback.format_exc()[-300:]}"
+                        text=f"Trade execution error for {sig['ticker']}:\n"
+                             f"{traceback.format_exc()[-300:]}"
                     )
 
         except Exception as e:
-            print(f"Failed to send {sig['ticker']}: {e}")
+            print(f"[scanner] Failed to send {sig['ticker']}: {e}")
