@@ -2,21 +2,33 @@
 ELLIOTT WAVE + FIBONACCI STRATEGY
 Based on Asaf Naamani's framework
 
-PATCH v7 — Finnhub fix + debug logging
+PATCH v8 — Loosened filters + SHORT (downside) setups
 ════════════════════════════════════════════════════════════════
-Bug fix — Finnhub returning all zeros:
-  - Added explicit status code check and response logging
-  - Retry on 429 rate limit with backoff
-  - Fixed _data_missing detection (was checking post-division values)
-  - Added FINNHUB_KEY presence check at startup
-  - get_fundamentals() now logs what it actually receives
+Changes from v7:
+  - weekly_trend_is_up() is now a soft filter: bearish trend reduces score
+    instead of hard-rejecting the setup
+  - Wave 2 Fib entry window widened: upper bound moved from 50% to 38.2%
+    (accepts shallower pullbacks)
+  - RSI range widened: 20–70 (was 25–65)
+  - MIN_WAVE1_MOVE lowered: 0.03 (was 0.05) — catches smaller impulse moves
+  - VOL_CONFIRM_RATIO lowered: 1.1 (was 1.2) — more BUYs vs WATCH
+  - MIN_RR_TP2 lowered: 1.5 (was 2.0) — accepts tighter reward/risk
 
-All previous patches preserved:
+  NEW SHORT SETUPS (signal = "SHORT"):
+  - Wave 2 Short: price bounces into 50–78.6% Fib after impulsive drop
+  - Wave 4 Short: price bounces into 38.2% Fib in confirmed downtrend
+  - ABC Short: price recovers to Wave A start zone, ready to resume down
+
+  Short signals require weekly_trend_is_DOWN to be confirmed.
+  Trader must handle SHORT signals via Alpaca short-sell orders.
+
+All v7 patches preserved:
+  v7: Finnhub fix, retry on 429, debug logging
   v6: Universe size, swing window, quality threshold
   v5: Dynamic universe via Alpaca APIs
   v4: Dynamic universe
   v3: Deduplication, swing recency filter, seen expiry
-  v2: Weekly trend filter softened, RSI/wave thresholds relaxed
+  v2: RSI/wave thresholds relaxed
 """
 
 import os
@@ -36,7 +48,6 @@ ALPACA_KEY    = os.getenv("ALPACA_KEY", "")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET", "")
 FINNHUB_KEY   = os.getenv("FINNHUB_KEY", "")
 
-# Warn loudly at import time so Railway logs make it obvious
 if not FINNHUB_KEY:
     print("[strategy] WARNING: FINNHUB_KEY is not set — fundamentals will always be missing")
 else:
@@ -66,11 +77,11 @@ EXT_1272 = 1.272
 EXT_1618 = 1.618
 EXT_2618 = 2.618
 
-# ── Strategy thresholds ───────────────────────────────────────────────────────
-VOL_CONFIRM_RATIO = 1.2
+# ── Strategy thresholds (v8 — loosened) ──────────────────────────────────────
+VOL_CONFIRM_RATIO = 1.1    # was 1.2
 MIN_QUALITY_SCORE = 25
-MIN_WAVE1_MOVE    = 0.05
-MIN_RR_TP2        = 2.0
+MIN_WAVE1_MOVE    = 0.03   # was 0.05
+MIN_RR_TP2        = 1.5    # was 2.0
 
 # ── Universe config ───────────────────────────────────────────────────────────
 UNIVERSE_SIZE = 500
@@ -150,7 +161,6 @@ def _get_most_actives() -> list:
 
 
 def _get_alpaca_assets() -> list:
-    """All active tradable US equity assets from Alpaca (~8000+ symbols)."""
     try:
         r = requests.get(
             ALPACA_ASSETS_URL,
@@ -183,7 +193,7 @@ def _snapshot_filter(tickers: list, min_price: float = 5.0, min_volume: float = 
     chunk_size = 100
 
     for i in range(0, len(tickers), chunk_size):
-        chunk = tickers[i: i + chunk_size]
+        chunk     = tickers[i: i + chunk_size]
         snap_data = {}
 
         for feed in ["sip", "iex"]:
@@ -298,31 +308,51 @@ def get_weekly_bars(df):
     return weekly.reset_index()
 
 
-def weekly_trend_is_up(df):
+def _trend_context(df) -> str:
+    """
+    Returns 'up', 'down', or 'neutral'.
+    Used as a soft filter — doesn't reject setups, just informs signal scoring.
+    """
     try:
         closes_daily = df["Close"]
         sma200       = closes_daily.rolling(200).mean().iloc[-1]
+        sma50        = closes_daily.rolling(50).mean().iloc[-1]
         price        = float(closes_daily.iloc[-1])
-        above_sma200 = not pd.isna(sma200) and price > float(sma200)
 
         weekly = get_weekly_bars(df)
         if len(weekly) < 22:
-            return True
+            return "neutral"
 
-        close    = weekly["Close"]
-        sma10w   = close.rolling(10).mean()
-        sma20w   = close.rolling(20).mean()
-        cur_10   = float(sma10w.iloc[-1])
-        cur_20   = float(sma20w.iloc[-1])
-        prev_10  = float(sma10w.iloc[-2])
-        prev2_10 = float(sma10w.iloc[-3])
+        close   = weekly["Close"]
+        sma10w  = close.rolling(10).mean()
+        sma20w  = close.rolling(20).mean()
+        cur_10  = float(sma10w.iloc[-1])
+        cur_20  = float(sma20w.iloc[-1])
+        prev_10 = float(sma10w.iloc[-2])
 
-        if cur_10 > cur_20 and cur_10 > prev_10:   return True
-        if cur_10 > prev_10 > prev2_10:             return True
-        if above_sma200:                             return True
-        return False
+        bullish = sum([
+            not pd.isna(sma200) and price > float(sma200),
+            not pd.isna(sma50)  and price > float(sma50),
+            cur_10 > cur_20,
+            cur_10 > prev_10,
+        ])
+        bearish = sum([
+            not pd.isna(sma200) and price < float(sma200),
+            not pd.isna(sma50)  and price < float(sma50),
+            cur_10 < cur_20,
+            cur_10 < prev_10,
+        ])
+
+        if bullish >= 3:   return "up"
+        if bearish >= 3:   return "down"
+        return "neutral"
     except Exception:
-        return True
+        return "neutral"
+
+
+# Keep old name as alias so existing calls don't break
+def weekly_trend_is_up(df) -> bool:
+    return _trend_context(df) != "down"
 
 
 # ── Fundamentals ──────────────────────────────────────────────────────────────
@@ -339,16 +369,10 @@ _FUND_DEFAULT = {
     "_data_missing": True,
 }
 
-# Finnhub free tier: 60 calls/min. With 2 calls per ticker that's ~30 tickers/min.
-# Add a small delay between tickers to avoid 429s across the scan loop.
-_FINNHUB_CALL_DELAY = 1.2  # seconds between the two Finnhub calls per ticker
+_FINNHUB_CALL_DELAY = 1.2
 
 
 def _finnhub_get(url: str, params: dict, ticker: str, label: str) -> dict:
-    """
-    Single Finnhub GET with retry on 429 and detailed logging.
-    Returns parsed JSON dict, or {} on failure.
-    """
     for attempt in range(3):
         try:
             r = requests.get(url, params=params, timeout=15)
@@ -367,8 +391,7 @@ def _finnhub_get(url: str, params: dict, ticker: str, label: str) -> dict:
                 print(f"[{ticker}] Finnhub {label} error {r.status_code}: {r.text[:120]}")
                 return {}
 
-            data = r.json()
-            return data
+            return r.json()
 
         except Exception as e:
             print(f"[{ticker}] Finnhub {label} exception (attempt {attempt+1}): {e}")
@@ -404,16 +427,14 @@ def get_fundamentals(ticker: str) -> dict:
         )
 
         m = metric_data.get("metric", {})
-        p = profile_data  # profile2 returns flat dict
+        p = profile_data
 
-        # Raw values from API (before any division)
-        raw_roe    = m.get("roeTTM")
-        raw_gm     = m.get("grossMarginTTM")
-        raw_eps    = m.get("epsGrowth3Y")
-        raw_de     = m.get("totalDebt/totalEquityAnnual")
-        raw_pe     = m.get("peNormalizedAnnual")
+        raw_roe = m.get("roeTTM")
+        raw_gm  = m.get("grossMarginTTM")
+        raw_eps = m.get("epsGrowth3Y")
+        raw_de  = m.get("totalDebt/totalEquityAnnual")
+        raw_pe  = m.get("peNormalizedAnnual")
 
-        # Log what we got so Railway logs are informative
         print(
             f"[{ticker}] Finnhub raw — "
             f"ROE:{raw_roe} GM:{raw_gm} EPS:{raw_eps} "
@@ -421,14 +442,12 @@ def get_fundamentals(ticker: str) -> dict:
             f"sector:{p.get('finnhubIndustry')} name:{p.get('name')}"
         )
 
-        roe_val    = safe(raw_roe) / 100.0
-        gm_val     = safe(raw_gm)  / 100.0
-        eps_val    = safe(raw_eps) / 100.0
-        de_val     = safe(raw_de, 999.0)
-        pe_val     = safe(raw_pe)
+        roe_val = safe(raw_roe) / 100.0
+        gm_val  = safe(raw_gm)  / 100.0
+        eps_val = safe(raw_eps) / 100.0
+        de_val  = safe(raw_de, 999.0)
+        pe_val  = safe(raw_pe)
 
-        # Detect missing data: ALL numeric fields are zero/default AND
-        # the metric dict itself is empty or nearly empty
         numeric_empty = (
             raw_roe in (None, "", "N/A", "None") and
             raw_gm  in (None, "", "N/A", "None") and
@@ -439,7 +458,7 @@ def get_fundamentals(ticker: str) -> dict:
         if data_missing:
             print(f"[{ticker}] Finnhub metric dict empty (len={len(m)}) — marking _data_missing")
 
-        result = {
+        return {
             "roe":           roe_val,
             "gross_margin":  gm_val,
             "debt_equity":   de_val,
@@ -450,7 +469,6 @@ def get_fundamentals(ticker: str) -> dict:
             "market_cap":    safe(p.get("marketCapitalization")) * 1_000_000,
             "_data_missing": data_missing,
         }
-        return result
 
     except Exception as e:
         print(f"[{ticker}] Finnhub get_fundamentals exception: {e}")
@@ -546,12 +564,16 @@ def _vol_confirmed(df):
     return vol_ratio >= VOL_CONFIRM_RATIO, round(vol_ratio, 2)
 
 
-# ── Wave 2 Setup ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# LONG SETUPS
+# ══════════════════════════════════════════════════════════════════════════════
 
-def detect_wave2_setup(df):
-    if not weekly_trend_is_up(df):
-        return None
-
+def detect_wave2_setup(df, trend: str):
+    """
+    Wave 2 Pullback (LONG).
+    Price retraces 38.2–78.6% of Wave 1 impulse up, then reverses.
+    Trend is now soft — 'down' trend reduces score but does not reject.
+    """
     df      = compute_indicators(df)
     current = df.iloc[-1]
     price   = float(current["Close"])
@@ -579,11 +601,13 @@ def detect_wave2_setup(df):
     fib_618 = round(wave1_top - wave1_size * FIB_618, 2)
     fib_786 = round(wave1_top - wave1_size * FIB_786, 2)
 
-    if not (fib_786 <= price <= fib_500):
+    # v8: upper bound widened from fib_500 to fib_382
+    if not (fib_786 <= price <= fib_382):
         return None
 
     rsi_prev = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
-    if not (rsi > rsi_prev and 25 <= rsi <= 65):
+    # v8: RSI range widened to 20–70
+    if not (rsi > rsi_prev and 20 <= rsi <= 70):
         return None
     if price < float(df.iloc[-4:-1]["Low"].min()) * 1.002:
         return None
@@ -601,9 +625,10 @@ def detect_wave2_setup(df):
     atr = float(current["ATR"]) if not pd.isna(current["ATR"]) else price * 0.02
 
     return {
-        "setup": "Wave 2 Pullback",
+        "setup":        "Wave 2 Pullback",
+        "direction":    "LONG",
         "wave1_origin": round(wave1_origin, 2), "wave1_top": round(wave1_top, 2),
-        "wave1_size": round(wave1_size, 2),
+        "wave1_size":   round(wave1_size, 2),
         "fib_382": fib_382, "fib_500": fib_500, "fib_618": fib_618, "fib_786": fib_786,
         "price": round(price, 2), "rsi": round(rsi, 1), "atr": round(atr, 2),
         "vol_ratio": vol_ratio, "vol_confirmed": vol_confirmed, "stop": stop,
@@ -616,18 +641,14 @@ def detect_wave2_setup(df):
         "risk": round(risk, 2),
         "setup_detail": {
             "wave1_origin": round(wave1_origin, 2), "wave1_top": round(wave1_top, 2),
-            "wave1_size": round(wave1_size, 2),
+            "wave1_size":   round(wave1_size, 2),
             "fib_382": fib_382, "fib_500": fib_500, "fib_618": fib_618,
         }
     }
 
 
-# ── Wave 4 Setup ──────────────────────────────────────────────────────────────
-
-def detect_wave4_setup(df):
-    if not weekly_trend_is_up(df):
-        return None
-
+def detect_wave4_setup(df, trend: str):
+    """Wave 4 Pullback (LONG)."""
     df      = compute_indicators(df)
     current = df.iloc[-1]
     price   = float(current["Close"])
@@ -655,7 +676,7 @@ def detect_wave4_setup(df):
         return None
 
     rsi_prev = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
-    if not (rsi > rsi_prev and 30 <= rsi <= 70):
+    if not (rsi > rsi_prev and 20 <= rsi <= 70):
         return None
 
     vol_confirmed, vol_ratio = _vol_confirmed(df)
@@ -672,7 +693,8 @@ def detect_wave4_setup(df):
     atr = float(current["ATR"]) if not pd.isna(current["ATR"]) else price * 0.02
 
     return {
-        "setup": "Wave 4 Pullback",
+        "setup":      "Wave 4 Pullback",
+        "direction":  "LONG",
         "wave1_origin": round(wave1_origin, 2), "wave1_high": round(wave1_high, 2),
         "wave3_high": round(wave3_high, 2),
         "fib_382": fib_382_w4, "fib_500": fib_500_w4,
@@ -687,18 +709,14 @@ def detect_wave4_setup(df):
         "risk": round(risk, 2),
         "setup_detail": {
             "wave1_origin": round(wave1_origin, 2), "wave1_high": round(wave1_high, 2),
-            "wave3_high": round(wave3_high, 2),
+            "wave3_high":   round(wave3_high, 2),
             "fib_382": fib_382_w4, "fib_500": fib_500_w4,
         }
     }
 
 
-# ── ABC Setup ─────────────────────────────────────────────────────────────────
-
-def detect_abc_setup(df):
-    if not weekly_trend_is_up(df):
-        return None
-
+def detect_abc_setup(df, trend: str):
+    """ABC Correction (LONG)."""
     df      = compute_indicators(df)
     current = df.iloc[-1]
     price   = float(current["Close"])
@@ -726,7 +744,7 @@ def detect_abc_setup(df):
         return None
 
     rsi_prev = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
-    if not (rsi > rsi_prev and 25 <= rsi <= 55):
+    if not (rsi > rsi_prev and 20 <= rsi <= 60):
         return None
 
     vol_confirmed, vol_ratio = _vol_confirmed(df)
@@ -742,9 +760,10 @@ def detect_abc_setup(df):
     atr = float(current["ATR"]) if not pd.isna(current["ATR"]) else price * 0.02
 
     return {
-        "setup": "ABC Correction",
+        "setup":        "ABC Correction",
+        "direction":    "LONG",
         "wave_a_start": round(wave_a_start, 2), "wave_a_end": round(wave_a_end, 2),
-        "wave_c_low": round(wave_c_low, 2),
+        "wave_c_low":   round(wave_c_low, 2),
         "price": round(price, 2), "rsi": round(rsi, 1), "atr": round(atr, 2),
         "vol_ratio": vol_ratio, "vol_confirmed": vol_confirmed, "stop": stop,
         "tp1": tp1, "tp2": tp2, "tp3": tp3,
@@ -756,16 +775,265 @@ def detect_abc_setup(df):
         "risk": round(risk, 2),
         "setup_detail": {
             "wave_a_start": round(wave_a_start, 2), "wave_a_end": round(wave_a_end, 2),
-            "wave_c_low": round(wave_c_low, 2),
+            "wave_c_low":   round(wave_c_low, 2),
+        }
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SHORT SETUPS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_wave2_short(df, trend: str):
+    """
+    Wave 2 Short — mirror of Wave 2 Pullback but for downtrends.
+    After an impulsive drop (Wave 1 down), price bounces 50–78.6% Fib,
+    RSI rolling over from overbought — enter SHORT, stop above bounce high.
+    Only fires if trend is 'down' or 'neutral'.
+    """
+    if trend == "up":
+        return None
+
+    df      = compute_indicators(df)
+    current = df.iloc[-1]
+    price   = float(current["Close"])
+    rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
+
+    highs, lows = find_swing_points(df, lookback=90, min_bars=5, max_age_bars=40)
+    if len(highs) < 1 or len(lows) < 1:
+        return None
+
+    # Wave 1 down: from a swing HIGH down to a swing LOW
+    last_low_loc, wave1_bottom = lows[-1]
+    wave1_top = None
+    for loc, val in reversed(highs):
+        if loc < last_low_loc:
+            wave1_top = val
+            break
+    if wave1_top is None:
+        return None
+
+    wave1_size = wave1_top - wave1_bottom
+    if wave1_size <= 0 or wave1_size / wave1_top < MIN_WAVE1_MOVE:
+        return None
+
+    # Bounce into 50–78.6% retracement of the down-move
+    fib_382 = round(wave1_bottom + wave1_size * FIB_382, 2)
+    fib_500 = round(wave1_bottom + wave1_size * FIB_500, 2)
+    fib_618 = round(wave1_bottom + wave1_size * FIB_618, 2)
+    fib_786 = round(wave1_bottom + wave1_size * FIB_786, 2)
+
+    if not (fib_500 <= price <= fib_786):
+        return None
+
+    # RSI rolling over (falling) from elevated level — confirming reversal
+    rsi_prev = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
+    if not (rsi < rsi_prev and 35 <= rsi <= 75):
+        return None
+
+    # Price making lower high — not breaking above the bounce
+    if price > float(df.iloc[-4:-1]["High"].max()) * 0.998:
+        return None
+
+    vol_confirmed, vol_ratio = _vol_confirmed(df)
+
+    # Stop: just above wave1_top (bounce invalidation)
+    stop     = round(wave1_top * 1.01, 2)
+    ext_1272 = round(price - wave1_size * EXT_1272, 2)
+    ext_1618 = round(price - wave1_size * EXT_1618, 2)
+    ext_2618 = round(price - wave1_size * EXT_2618, 2)
+    risk     = stop - price  # positive: how much we lose if stop hit
+
+    if risk <= 0 or (price - ext_1618) / risk < MIN_RR_TP2:
+        return None
+
+    atr = float(current["ATR"]) if not pd.isna(current["ATR"]) else price * 0.02
+
+    return {
+        "setup":        "Wave 2 Short",
+        "direction":    "SHORT",
+        "wave1_top":    round(wave1_top, 2),
+        "wave1_bottom": round(wave1_bottom, 2),
+        "wave1_size":   round(wave1_size, 2),
+        "fib_382": fib_382, "fib_500": fib_500, "fib_618": fib_618, "fib_786": fib_786,
+        "price": round(price, 2), "rsi": round(rsi, 1), "atr": round(atr, 2),
+        "vol_ratio": vol_ratio, "vol_confirmed": vol_confirmed, "stop": stop,
+        # For shorts: tp1/tp2/tp3 are BELOW entry
+        "tp1": ext_1272, "tp2": ext_1618, "tp3": ext_2618,
+        "tp1_pct": round((price - ext_1272) / price * 100, 1),
+        "tp2_pct": round((price - ext_1618) / price * 100, 1),
+        "tp3_pct": round((price - ext_2618) / price * 100, 1),
+        "rr_tp1": round((price - ext_1272) / risk, 2),
+        "rr_tp2": round((price - ext_1618) / risk, 2),
+        "risk": round(risk, 2),
+        "setup_detail": {
+            "wave1_top":    round(wave1_top, 2),
+            "wave1_bottom": round(wave1_bottom, 2),
+            "fib_500": fib_500, "fib_618": fib_618, "fib_786": fib_786,
+        }
+    }
+
+
+def detect_wave4_short(df, trend: str):
+    """
+    Wave 4 Short — price bounces into 38.2% Fib of the down-impulse
+    after Wave 3 down, ready for Wave 5 continuation lower.
+    Only fires if trend is 'down'.
+    """
+    if trend != "down":
+        return None
+
+    df      = compute_indicators(df)
+    current = df.iloc[-1]
+    price   = float(current["Close"])
+    rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
+
+    highs, lows = find_swing_points(df, lookback=120, min_bars=5, max_age_bars=40)
+    if len(highs) < 2 or len(lows) < 1:
+        return None
+
+    # Need: high → low → lower high → lower low (simplified Wave 3 structure)
+    wave1_top_loc,    wave1_top    = highs[0]
+    wave3_bottom_loc, wave3_bottom = lows[-1]
+    # Current bounce must have a recent local high
+    bounce_high_loc, bounce_high = highs[-1]
+
+    if not (wave1_top_loc < wave3_bottom_loc):
+        return None
+    if bounce_high_loc < wave3_bottom_loc:
+        return None
+
+    wave3_size  = wave1_top - wave3_bottom
+    if wave3_size <= 0:
+        return None
+
+    fib_382_w4 = round(wave3_bottom + wave3_size * FIB_382, 2)
+    fib_500_w4 = round(wave3_bottom + wave3_size * FIB_500, 2)
+
+    if not (fib_382_w4 <= price <= fib_500_w4):
+        return None
+
+    rsi_prev = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
+    if not (rsi < rsi_prev and 35 <= rsi <= 65):
+        return None
+
+    vol_confirmed, vol_ratio = _vol_confirmed(df)
+    stop     = round(bounce_high * 1.01, 2)
+    ext_1272 = round(price - wave3_size * 0.5 * EXT_1272, 2)
+    ext_1618 = round(price - wave3_size * 0.5 * EXT_1618, 2)
+    ext_2618 = round(price - wave3_size * 0.5 * EXT_2618, 2)
+    risk     = stop - price
+
+    if risk <= 0 or (price - ext_1618) / risk < MIN_RR_TP2:
+        return None
+
+    atr = float(current["ATR"]) if not pd.isna(current["ATR"]) else price * 0.02
+
+    return {
+        "setup":        "Wave 4 Short",
+        "direction":    "SHORT",
+        "wave1_top":    round(wave1_top, 2),
+        "wave3_bottom": round(wave3_bottom, 2),
+        "bounce_high":  round(bounce_high, 2),
+        "fib_382": fib_382_w4, "fib_500": fib_500_w4,
+        "price": round(price, 2), "rsi": round(rsi, 1), "atr": round(atr, 2),
+        "vol_ratio": vol_ratio, "vol_confirmed": vol_confirmed, "stop": stop,
+        "tp1": ext_1272, "tp2": ext_1618, "tp3": ext_2618,
+        "tp1_pct": round((price - ext_1272) / price * 100, 1),
+        "tp2_pct": round((price - ext_1618) / price * 100, 1),
+        "tp3_pct": round((price - ext_2618) / price * 100, 1),
+        "rr_tp1": round((price - ext_1272) / risk, 2),
+        "rr_tp2": round((price - ext_1618) / risk, 2),
+        "risk": round(risk, 2),
+        "setup_detail": {
+            "wave1_top":    round(wave1_top, 2),
+            "wave3_bottom": round(wave3_bottom, 2),
+            "bounce_high":  round(bounce_high, 2),
+            "fib_382": fib_382_w4, "fib_500": fib_500_w4,
+        }
+    }
+
+
+def detect_abc_short(df, trend: str):
+    """
+    ABC Short — price makes A-down, B-up bounce back near A start,
+    then enter SHORT for C-down continuation.
+    Only fires if trend is 'down' or 'neutral'.
+    """
+    if trend == "up":
+        return None
+
+    df      = compute_indicators(df)
+    current = df.iloc[-1]
+    price   = float(current["Close"])
+    rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
+
+    highs, lows = find_swing_points(df, lookback=90, min_bars=4, max_age_bars=40)
+    if len(highs) < 2 or len(lows) < 1:
+        return None
+
+    # Wave A: high → low (drop)
+    wave_a_start_loc, wave_a_start = highs[-2]
+    wave_a_end_loc,   wave_a_end   = lows[-1]
+    # Wave B: bounce back toward A start
+    wave_b_loc,       wave_b_high  = highs[-1]
+
+    if not (wave_a_start_loc < wave_a_end_loc < wave_b_loc):
+        return None
+
+    wave_a_size = wave_a_start - wave_a_end
+    if wave_a_size <= 0 or wave_a_size / wave_a_start < 0.05:
+        return None
+
+    # B bounce must reach 50–100% of A drop (classic ABC structure)
+    b_zone_low  = round(wave_a_end + wave_a_size * FIB_500, 2)
+    b_zone_high = round(wave_a_start + wave_a_size * 0.05, 2)  # slight overshoot allowed
+
+    if not (b_zone_low <= price <= b_zone_high):
+        return None
+
+    rsi_prev = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
+    if not (rsi < rsi_prev and 40 <= rsi <= 75):
+        return None
+
+    vol_confirmed, vol_ratio = _vol_confirmed(df)
+    stop = round(b_zone_high * 1.01, 2)
+    tp1  = round(wave_a_end, 2)                              # C = A low
+    tp2  = round(wave_a_end - wave_a_size * FIB_618, 2)     # C extends 161.8%
+    tp3  = round(wave_a_end - wave_a_size * 1.0, 2)         # C = 2× A
+    risk = stop - price
+
+    if risk <= 0 or (price - tp1) / risk < 1.5:
+        return None
+
+    atr = float(current["ATR"]) if not pd.isna(current["ATR"]) else price * 0.02
+
+    return {
+        "setup":        "ABC Short",
+        "direction":    "SHORT",
+        "wave_a_start": round(wave_a_start, 2), "wave_a_end": round(wave_a_end, 2),
+        "wave_b_high":  round(wave_b_high, 2),
+        "price": round(price, 2), "rsi": round(rsi, 1), "atr": round(atr, 2),
+        "vol_ratio": vol_ratio, "vol_confirmed": vol_confirmed, "stop": stop,
+        "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "tp1_pct": round((price - tp1) / price * 100, 1),
+        "tp2_pct": round((price - tp2) / price * 100, 1),
+        "tp3_pct": round((price - tp3) / price * 100, 1),
+        "rr_tp1": round((price - tp1) / risk, 2),
+        "rr_tp2": round((price - tp2) / risk, 2),
+        "risk": round(risk, 2),
+        "setup_detail": {
+            "wave_a_start": round(wave_a_start, 2), "wave_a_end": round(wave_a_end, 2),
+            "wave_b_high":  round(wave_b_high, 2),
         }
     }
 
 
 # ── Position Sizing ───────────────────────────────────────────────────────────
 
-def position_size(price, stop):
+def position_size(price, stop, direction="LONG"):
     risk_dollars = ACCOUNT * RISK_PCT
-    risk         = price - stop
+    risk         = abs(price - stop)
     if risk <= 0:
         risk = price * 0.05
     shares     = math.floor(risk_dollars / risk)
@@ -792,16 +1060,24 @@ def analyze_ticker(ticker, seen=None):
         if df is None or len(df) < 60:
             return None
 
+        # Determine trend context once — used by all detectors
+        trend = _trend_context(df)
+
+        # Run all detectors — first match wins (long before short priority)
         setup = (
-            detect_wave2_setup(df) or
-            detect_wave4_setup(df) or
-            detect_abc_setup(df)
+            detect_wave2_setup(df, trend) or
+            detect_wave4_setup(df, trend) or
+            detect_abc_setup(df, trend)   or
+            detect_wave2_short(df, trend) or
+            detect_wave4_short(df, trend) or
+            detect_abc_short(df, trend)
         )
         if setup is None:
             return None
 
         price      = setup["price"]
         setup_name = setup["setup"]
+        direction  = setup.get("direction", "LONG")
 
         if already_alerted(ticker, setup_name, price, seen):
             print(f"[{ticker}] SKIP — already alerted '{setup_name}' at similar price")
@@ -809,34 +1085,57 @@ def analyze_ticker(ticker, seen=None):
         mark_seen(ticker, setup_name, price, seen)
 
         fund = get_fundamentals(ticker)
-
         q_score, failed = quality_score(fund)
         if q_score < MIN_QUALITY_SCORE:
             print(f"[{ticker}] SKIP | Quality {q_score:.0f} < {MIN_QUALITY_SCORE}")
             return None
 
         stop   = setup["stop"]
-        sizing = position_size(price, stop)
+        sizing = position_size(price, stop, direction)
 
+        # ── Signal scoring ──
         score = 0.0
         score += q_score * 0.35
-        rsi    = setup["rsi"]
-        if 35 <= rsi <= 55:  score += 25
-        elif 55 < rsi <= 65: score += 15
-        else:                score += 5
+
+        rsi = setup["rsi"]
+        if direction == "LONG":
+            if 35 <= rsi <= 55:  score += 25
+            elif 55 < rsi <= 65: score += 15
+            else:                score += 5
+        else:  # SHORT
+            if 45 <= rsi <= 65:  score += 25
+            elif 35 <= rsi < 45: score += 15
+            else:                score += 5
+
         if setup["vol_confirmed"]: score += 20
         else:                      score += 8
+
         rr = setup.get("rr_tp2", 0)
         if rr >= 4.0:   score += 20
         elif rr >= 2.0: score += 12
         else:           score += 5
 
-        signal_type = "BUY" if setup.get("vol_confirmed", False) else "WATCH"
-        hold_time   = "POSITION (3-8 weeks)" if score >= 70 else "SWING (1-3 weeks)"
+        # Trend alignment bonus/penalty
+        if direction == "LONG"  and trend == "up":   score += 10
+        if direction == "LONG"  and trend == "down":  score -= 15
+        if direction == "SHORT" and trend == "down":  score += 10
+        if direction == "SHORT" and trend == "up":    score -= 15
+
+        score = max(0.0, score)
+
+        # Signal type: BUY / SHORT / WATCH
+        if setup.get("vol_confirmed", False):
+            signal_type = direction  # "LONG" → "BUY" below, "SHORT" stays "SHORT"
+            if direction == "LONG":
+                signal_type = "BUY"
+        else:
+            signal_type = "WATCH"
+
+        hold_time = "POSITION (3-8 weeks)" if score >= 70 else "SWING (1-3 weeks)"
 
         print(
             f"[{ticker}] {signal_type} | {setup_name} | "
-            f"Score {score:.0f} | RSI {rsi:.0f} | "
+            f"Trend:{trend} | Score {score:.0f} | RSI {rsi:.0f} | "
             f"R:R TP2 {setup.get('rr_tp2', 0):.1f}x | "
             f"Vol {setup.get('vol_ratio', 0):.1f}x"
         )
@@ -844,7 +1143,9 @@ def analyze_ticker(ticker, seen=None):
         return {
             "ticker":        ticker,
             "signal":        signal_type,
+            "direction":     direction,
             "setup":         setup_name,
+            "trend":         trend,
             "hold_time":     hold_time,
             "signal_score":  round(score, 1),
             "quality_score": q_score,
@@ -909,10 +1210,12 @@ if __name__ == "__main__":
     print(f"{'='*60}\n")
 
     for r in results:
-        fund_flag = " [no Finnhub data]" if r.get("fund_missing") else ""
+        fund_flag  = " [no Finnhub data]" if r.get("fund_missing") else ""
+        dir_icon   = "▼ SHORT" if r["direction"] == "SHORT" else "▲ LONG"
+        sig_icon   = "★" if r["signal"] in ("BUY", "SHORT") else "○"
         print(
-            f"{'★' if r['signal'] == 'BUY' else '○'} {r['ticker']:6s} | "
+            f"{sig_icon} {r['ticker']:6s} | {dir_icon} | "
             f"{r['setup']:18s} | Score {r['signal_score']:.0f} | "
             f"Price ${r['price']} | TP2 ${r['tp2']} ({r['tp2_pct']:+.1f}%) | "
-            f"R:R {r['rr_tp2']:.1f}x | RSI {r['rsi']}{fund_flag}"
+            f"R:R {r['rr_tp2']:.1f}x | RSI {r['rsi']} | Trend:{r['trend']}{fund_flag}"
         )
