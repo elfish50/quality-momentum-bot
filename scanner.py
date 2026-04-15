@@ -5,6 +5,10 @@ Runs analyze_ticker() across the full universe, formats alerts,
 and auto-executes BUY and SHORT signals via trader.py.
 """
 
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import asyncio
 import traceback
 from datetime import datetime
@@ -35,7 +39,6 @@ def format_alert(sig: dict) -> str:
     trend_map = {"up": "📈 Up", "down": "📉 Down", "neutral": "➡️ Neutral"}
     trend_str = trend_map.get(trend, trend)
 
-    # TP direction label
     tp_dir = "+" if direction == "LONG" else "-"
 
     lines = [
@@ -60,7 +63,6 @@ def format_alert(sig: dict) -> str:
         f"Hold:     {sig['hold_time']}",
     ]
 
-    # Fundamentals block
     if not sig.get("fund_missing"):
         lines += [
             f"",
@@ -146,7 +148,6 @@ async def run_universe_scan(bot, chat_id: str, tickers: list = None):
             await bot.send_message(chat_id=chat_id, text=format_alert(sig))
             await asyncio.sleep(0.3)
 
-            # Auto-execute BUY and SHORT signals
             if sig["signal"] in ("BUY", "SHORT"):
                 try:
                     from trader import execute_signal, format_execution_result
@@ -160,7 +161,6 @@ async def run_universe_scan(bot, chat_id: str, tickers: list = None):
                         text=format_execution_result(result, sig)
                     )
 
-                    # Persist to open_positions.json so monitor.py can track it
                     if result.get("success"):
                         add_position(sig, result)
 
