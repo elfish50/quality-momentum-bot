@@ -22,7 +22,7 @@ import os
 import math
 import traceback
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ALPACA_KEY    = os.getenv("ALPACA_KEY", "")
@@ -359,5 +359,132 @@ def format_execution_result(result: dict, sig: dict) -> str:
         f"  TP1:    {result.get('tp1_order_id','?')[:8] or 'failed'}",
         f"  Stop:   {result.get('stop_order_id','?')[:8] or 'failed'}",
     ]
+
+    return "\n".join(lines)
+
+
+# ── Portfolio & Trade History ─────────────────────────────────────────────────
+
+def _fetch_portfolio_history(period: str, timeframe: str) -> list[float]:
+    """
+    Fetch equity curve from Alpaca portfolio history.
+    Returns list of equity values (oldest → newest), or [] on failure.
+    """
+    try:
+        params = {"timeframe": timeframe}
+        if period != "all":
+            params["period"] = period
+        r = requests.get(
+            f"{PAPER_URL}/account/portfolio/history",
+            headers=HEADERS,
+            params=params,
+            timeout=15,
+        )
+        if not r.ok:
+            return []
+        data = r.json()
+        equity = data.get("equity", [])
+        return [float(v) for v in equity if v is not None]
+    except Exception:
+        return []
+
+
+def _calc_gain(equity_series: list[float]) -> tuple[float | None, float | None]:
+    """Given an equity series, return (dollar_gain, pct_gain) or (None, None)."""
+    if len(equity_series) < 2:
+        return None, None
+    start = equity_series[0]
+    end   = equity_series[-1]
+    if start == 0:
+        return None, None
+    gain = end - start
+    pct  = gain / start * 100
+    return gain, pct
+
+
+def _fmt_gain(label: str, gain: float | None, pct: float | None) -> str:
+    if gain is None:
+        return f"{label}: N/A"
+    arrow = "🟢" if gain >= 0 else "🔴"
+    sign  = "+" if gain >= 0 else ""
+    return f"{label}: {arrow} {sign}${gain:,.2f} ({sign}{pct:.2f}%)"
+
+
+def format_portfolio() -> str:
+    acc       = get_account()
+    positions = get_positions()
+
+    equity  = float(acc.get("equity", 0))
+    cash    = float(acc.get("cash", 0))
+    last_eq = float(acc.get("last_equity", equity) or equity)
+    pl_day  = equity - last_eq
+    pl_pct  = pl_day / last_eq * 100 if last_eq > 0 else 0
+
+    week_gain,    week_pct    = _calc_gain(_fetch_portfolio_history("1W", "1D"))
+    month_gain,   month_pct   = _calc_gain(_fetch_portfolio_history("1M", "1D"))
+    alltime_gain, alltime_pct = _calc_gain(_fetch_portfolio_history("all", "1D"))
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    lines = [
+        f"{'='*36}",
+        "PAPER PORTFOLIO",
+        f"{'='*36}",
+        f"Updated:  {now}",
+        "",
+        f"Equity:   ${equity:,.2f}",
+        f"Cash:     ${cash:,.2f}",
+        "",
+        "── Performance ──────────────────────",
+        _fmt_gain("Day    ", pl_day, pl_pct),
+        _fmt_gain("1-Week ", week_gain, week_pct),
+        _fmt_gain("1-Month", month_gain, month_pct),
+        _fmt_gain("All-Time", alltime_gain, alltime_pct),
+        f"{'='*36}",
+        f"Positions: {len(positions)}",
+    ]
+
+    if not positions:
+        lines.append("No open positions.")
+    else:
+        lines.append("")
+        for p in positions:
+            if not isinstance(p, dict):
+                continue
+            sym       = p.get("symbol", "")
+            qty       = float(p.get("qty", 0))
+            avg_cost  = float(p.get("avg_entry_price", 0) or 0)
+            cur_price = float(p.get("current_price", 0) or 0)
+            pl_pos    = float(p.get("unrealized_pl", 0) or 0)
+            pl_pct_p  = float(p.get("unrealized_plpc", 0) or 0) * 100
+            sign      = "+" if pl_pos >= 0 else ""
+            lines.append(
+                f"{sym:<6} {qty:.0f}sh | "
+                f"${avg_cost:.2f}→${cur_price:.2f} | "
+                f"P&L {sign}${pl_pos:.2f} ({sign}{pl_pct_p:.1f}%)"
+            )
+
+    return "\n".join(lines)
+
+
+def format_trade_history() -> str:
+    orders = get_orders(status="closed")
+    filled = [
+        o for o in orders
+        if isinstance(o, dict) and o.get("status") == "filled"
+    ]
+
+    if not filled:
+        return "No completed trades yet."
+
+    lines = [f"{'='*36}", "RECENT TRADES", f"{'='*36}"]
+    for o in filled[:20]:
+        sym   = o.get("symbol", "")
+        side  = o.get("side", "").upper()
+        qty   = o.get("filled_qty", "?")
+        price = float(o.get("filled_avg_price") or 0)
+        date  = (o.get("filled_at", "") or "")[:10]
+        icon  = "🟢" if side == "BUY" else "🔴"
+        lines.append(f"{icon} {date} {side:<5} {sym:<6} {qty}sh @ ${price:.2f}")
 
     return "\n".join(lines)
