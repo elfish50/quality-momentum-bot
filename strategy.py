@@ -30,8 +30,9 @@ All v7 patches preserved:
   v3: Deduplication, swing recency filter, seen expiry
   v2: RSI/wave thresholds relaxed
 """
-
+import sys
 import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import json
 import math
 import pathlib
