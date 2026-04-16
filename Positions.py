@@ -1,162 +1,117 @@
 """
-scanner.py — Universe Scan + Alert Formatting
+positions.py — Open Trade Tracker
 
-Runs analyze_ticker() across the full universe, formats alerts,
-and auto-executes BUY and SHORT signals via trader.py.
+Persists open_positions.json. Records every trade (LONG or SHORT)
+with all levels needed by monitor.py to manage exits.
 """
 
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import asyncio
-import traceback
+import json
+import pathlib
 from datetime import datetime
 
-from strategy import (
-    analyze_ticker,
-    get_universe,
-    load_seen,
-    save_seen,
-)
-from trader import execute_signal, format_execution_result
-from positions import add_position
+POSITIONS_FILE = pathlib.Path("open_positions.json")
 
 
-# ── Alert Formatting ──────────────────────────────────────────────────────────
+def _load() -> dict:
+    if not POSITIONS_FILE.exists():
+        return {}
+    try:
+        return json.loads(POSITIONS_FILE.read_text())
+    except Exception:
+        return {}
 
-def format_alert(sig: dict) -> str:
-    direction = sig.get("direction", "LONG")
-    signal    = sig.get("signal", "WATCH")
-    trend     = sig.get("trend", "neutral")
 
-    if signal == "BUY":
-        header = "🟢 BUY — AUTO-EXECUTING"
-    elif signal == "SHORT":
-        header = "🔴 SHORT — AUTO-EXECUTING"
-    else:
-        header = "👀 WATCH — Waiting for volume"
+def _save(data: dict) -> None:
+    POSITIONS_FILE.write_text(json.dumps(data, indent=2))
 
-    dir_arrow = "▲" if direction == "LONG" else "▼"
-    trend_map = {"up": "📈 Up", "down": "📉 Down", "neutral": "➡️ Neutral"}
-    trend_str = trend_map.get(trend, trend)
 
-    tp_dir = "+" if direction == "LONG" else "-"
+def add_position(sig: dict, result: dict) -> None:
+    data   = _load()
+    ticker = sig["ticker"]
 
-    lines = [
-        f"{header}",
-        f"",
-        f"{'─'*30}",
-        f"📊 {sig['ticker']} — {sig['setup']}",
-        f"{'─'*30}",
-        f"Direction: {dir_arrow} {direction}  |  Trend: {trend_str}",
-        f"Score:    {sig['signal_score']:.0f}/100  |  Quality: {sig['quality_score']:.0f}",
-        f"",
-        f"Price:    ${sig['price']:.2f}",
-        f"RSI:      {sig['rsi']:.1f}  |  ATR: ${sig['atr']:.2f}",
-        f"Volume:   {sig['vol_ratio']:.1f}x avg {'✅' if sig['vol_confirmed'] else '⏳'}",
-        f"",
-        f"Stop:     ${sig['stop']:.2f}  (risk ${sig['risk_dollars']:.0f})",
-        f"TP1:      ${sig['tp1']:.2f}  ({tp_dir}{abs(sig['tp1_pct']):.1f}%)  R:R {sig['rr_tp1']:.1f}x",
-        f"TP2:      ${sig['tp2']:.2f}  ({tp_dir}{abs(sig['tp2_pct']):.1f}%)  R:R {sig['rr_tp2']:.1f}x",
-        f"TP3:      ${sig['tp3']:.2f}  ({tp_dir}{abs(sig['tp3_pct']):.1f}%)  stretch",
-        f"",
-        f"Sizing:   {sig['shares']} shares  (${sig['position_val']:.0f} / {sig['pct_account']:.0f}% acct)",
-        f"Hold:     {sig['hold_time']}",
-    ]
+    shares     = result.get("shares", sig.get("shares", 1))
+    tp1_shares = result.get("tp1_shares", max(1, shares // 3))
 
-    if not sig.get("fund_missing"):
+    data[ticker] = {
+        "ticker":        ticker,
+        "direction":     result.get("direction", sig.get("direction", "LONG")),
+        "seen_key":      f"{ticker}::{sig['setup']}",
+        "entry_price":   result.get("entry_price", sig.get("price", 0)),
+        "shares":        shares,
+        "tp1_shares":    tp1_shares,
+        "stop":          result.get("stop", sig.get("stop", 0)),
+        "tp1":           result.get("tp1", sig.get("tp1", 0)),
+        "tp2":           result.get("tp2", sig.get("tp2", 0)),
+        "tp3":           result.get("tp3", sig.get("tp3", 0)),
+        "tp1_hit":       False,
+        "tp1_order_id":  result.get("tp1_order_id", ""),
+        "stop_order_id": result.get("stop_order_id", ""),
+        "setup":         sig.get("setup", ""),
+        "signal_score":  sig.get("signal_score", 0),
+        "opened_at":     datetime.now().isoformat(),
+        "closed_at":     None,
+        "close_reason":  None,
+    }
+    _save(data)
+    print(f"[positions] Recorded {data[ticker]['direction']} position: {ticker}")
+
+
+def get_position(ticker: str) -> dict | None:
+    return _load().get(ticker)
+
+
+def get_all_positions() -> dict:
+    return _load()
+
+
+def get_open_positions() -> dict:
+    return {k: v for k, v in _load().items() if v.get("closed_at") is None}
+
+
+def mark_tp1_hit(ticker: str) -> None:
+    data = _load()
+    if ticker not in data:
+        return
+    data[ticker]["tp1_hit"] = True
+    _save(data)
+    print(f"[positions] TP1 hit recorded: {ticker}")
+
+
+def mark_closed(ticker: str, reason: str = "CLOSED") -> None:
+    data = _load()
+    if ticker not in data:
+        return
+    data[ticker]["closed_at"]    = datetime.now().isoformat()
+    data[ticker]["close_reason"] = reason
+    _save(data)
+    print(f"[positions] Closed: {ticker} — {reason}")
+
+
+def format_open_positions() -> str:
+    positions = get_open_positions()
+    if not positions:
+        return "No open tracked positions.\n\nRun /portfolio to see Alpaca account."
+
+    lines = [f"{'='*36}", "OPEN POSITIONS", f"{'='*36}"]
+    for ticker, pos in positions.items():
+        direction  = pos.get("direction", "LONG")
+        dir_icon   = "🔴 SHORT" if direction == "SHORT" else "🟢 LONG"
+        tp1_status = "✅ TP1 hit" if pos.get("tp1_hit") else "⏳ watching"
+        entry      = float(pos.get("entry_price", 0))
+        stop       = float(pos.get("stop", 0))
+        tp1        = float(pos.get("tp1", 0))
+        tp2        = float(pos.get("tp2", 0))
+        shares     = int(pos.get("shares", 0))
+        opened     = pos.get("opened_at", "")[:10]
+
         lines += [
             f"",
-            f"--- Fundamentals ---",
-            f"ROE:      {sig['roe']:.1f}%  |  Margin: {sig['gross_margin']:.1f}%",
-            f"EPS Grw:  {sig['eps_growth']:.1f}%  |  D/E: {sig['debt_equity']:.1f}x",
+            f"{dir_icon} {ticker} — {pos.get('setup','')}",
+            f"  Entry:  ${entry:.2f} × {shares} shares  [{opened}]",
+            f"  Stop:   ${stop:.2f}",
+            f"  TP1:    ${tp1:.2f}  {tp1_status}",
+            f"  TP2:    ${tp2:.2f}",
+            f"  Score:  {pos.get('signal_score', 0):.0f}",
         ]
-        if sig.get("quality_notes"):
-            lines.append(f"Warnings: {', '.join(sig['quality_notes'])}")
-    else:
-        lines.append(f"")
-        lines.append(f"⚠ Fundamentals unavailable")
-
-    if sig.get("sector"):
-        lines.append(f"Sector:   {sig['sector']}")
 
     return "\n".join(lines)
-
-
-# ── Universe Scan ─────────────────────────────────────────────────────────────
-
-def run_scan(tickers: list = None) -> list:
-    if tickers is None:
-        tickers = get_universe()
-
-    print(f"[scanner] Starting scan — {len(tickers)} tickers")
-    seen    = load_seen()
-    results = []
-
-    for ticker in tickers:
-        try:
-            result = analyze_ticker(ticker, seen)
-            if result:
-                results.append(result)
-                print(
-                    f"[scanner] ✅ {ticker} — {result['signal']} {result['setup']} "
-                    f"score:{result['signal_score']:.0f}"
-                )
-        except Exception:
-            print(f"[scanner] ERROR {ticker}: {traceback.format_exc()[-200:]}")
-
-    save_seen(seen)
-    results.sort(key=lambda x: x["signal_score"], reverse=True)
-    print(f"[scanner] Done — {len(results)} signal(s) found")
-    return results
-
-
-async def run_universe_scan(bot, chat_id: str, tickers: list = None):
-    loop = asyncio.get_event_loop()
-
-    try:
-        alerts = await loop.run_in_executor(None, lambda: run_scan(tickers))
-    except Exception:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"Scan error:\n{traceback.format_exc()[-400:]}"
-        )
-        return
-
-    if not alerts:
-        ts = datetime.now().strftime("%H:%M")
-        await bot.send_message(chat_id=chat_id, text=f"[{ts}] Scan complete — no setups found.")
-        return
-
-    await bot.send_message(
-        chat_id=chat_id,
-        text=f"📡 Scan complete — {len(alerts)} setup(s) found:"
-    )
-
-    for sig in alerts:
-        try:
-            await bot.send_message(chat_id=chat_id, text=format_alert(sig))
-            await asyncio.sleep(0.3)
-
-            if sig["signal"] in ("BUY", "SHORT"):
-                try:
-                    result = await loop.run_in_executor(
-                        None, lambda s=sig: execute_signal(s)
-                    )
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=format_execution_result(result, sig)
-                    )
-                    if result.get("success"):
-                        add_position(sig, result)
-
-                except Exception:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"Trade execution error for {sig['ticker']}:\n"
-                             f"{traceback.format_exc()[-300:]}"
-                    )
-
-        except Exception as e:
-            print(f"[scanner] Failed to send {sig['ticker']}: {e}")
