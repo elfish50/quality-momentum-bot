@@ -19,6 +19,8 @@ from strategy import (
     load_seen,
     save_seen,
 )
+from trader import execute_signal, format_execution_result
+from positions import add_position
 
 
 # ── Alert Formatting ──────────────────────────────────────────────────────────
@@ -85,10 +87,6 @@ def format_alert(sig: dict) -> str:
 # ── Universe Scan ─────────────────────────────────────────────────────────────
 
 def run_scan(tickers: list = None) -> list:
-    """
-    Synchronous scan over tickers list (or full universe if None).
-    Returns list of signal dicts sorted by signal_score descending.
-    """
     if tickers is None:
         tickers = get_universe()
 
@@ -115,17 +113,10 @@ def run_scan(tickers: list = None) -> list:
 
 
 async def run_universe_scan(bot, chat_id: str, tickers: list = None):
-    """
-    Async wrapper called by the scheduler and /scan command.
-    Runs the blocking scan in an executor, then sends alerts and executes trades.
-    """
     loop = asyncio.get_event_loop()
 
     try:
-        alerts = await loop.run_in_executor(
-            None,
-            lambda: run_scan(tickers)
-        )
+        alerts = await loop.run_in_executor(None, lambda: run_scan(tickers))
     except Exception:
         await bot.send_message(
             chat_id=chat_id,
@@ -150,9 +141,6 @@ async def run_universe_scan(bot, chat_id: str, tickers: list = None):
 
             if sig["signal"] in ("BUY", "SHORT"):
                 try:
-                    from trader import execute_signal, format_execution_result
-                    from positions import add_position
-
                     result = await loop.run_in_executor(
                         None, lambda s=sig: execute_signal(s)
                     )
@@ -160,7 +148,6 @@ async def run_universe_scan(bot, chat_id: str, tickers: list = None):
                         chat_id=chat_id,
                         text=format_execution_result(result, sig)
                     )
-
                     if result.get("success"):
                         add_position(sig, result)
 
