@@ -5,21 +5,26 @@ Handles both LONG (BUY) and SHORT signals from strategy.py.
 
 LONG flow:
   1. Market buy entry
-  2. GTC limit sell at TP1 (1/3 shares)
-  3. GTC stop-market sell below stop (all shares initially)
-     → monitor.py adjusts after TP1 hit (move stop to breakeven, reduce qty)
+  2. Wait for fill (poll up to 30s)
+  3. GTC limit sell at TP1 (1/3 shares)
+  4. GTC stop-market sell below stop (remaining shares)
 
 SHORT flow:
-  1. Market sell short entry
-  2. GTC limit buy-to-cover at TP1 (1/3 shares)
-  3. GTC stop-market buy-to-cover above stop (all shares initially)
-     → monitor.py adjusts after TP1 hit (move stop to breakeven, reduce qty)
+  1. Market sell_short entry
+  2. Wait for fill (poll up to 30s)
+  3. GTC limit buy-to-cover at TP1 (1/3 shares)
+  4. GTC stop-market buy-to-cover above stop (remaining shares)
 
-Alpaca paper trading endpoint is used throughout.
+FIX v2:
+  - Wait for entry fill before placing TP1/stop orders (Alpaca rejects
+    protective orders if position doesn't exist yet)
+  - Short entry uses side="sell_short" explicitly
+  - ACCOUNT reads live equity from Alpaca (not hardcoded $1k)
 """
 
 import os
 import math
+import time
 import traceback
 import requests
 from datetime import datetime, timezone
@@ -35,8 +40,11 @@ HEADERS = {
     "Content-Type":        "application/json",
 }
 
-ACCOUNT  = 1_000
-RISK_PCT = 0.10
+RISK_PCT = 0.01  # 1% of live equity per trade
+
+# Fill-wait config
+FILL_POLL_INTERVAL = 2    # seconds between polls
+FILL_POLL_MAX      = 15   # max attempts (= 30 seconds total)
 
 
 # ── Alpaca Account Helpers ────────────────────────────────────────────────────
@@ -47,6 +55,14 @@ def get_account():
         return r.json() if isinstance(r.json(), dict) else {}
     except Exception:
         return {}
+
+
+def get_account_equity() -> float:
+    try:
+        acc = get_account()
+        return float(acc.get("equity", 100_000))
+    except Exception:
+        return 100_000
 
 
 def get_buying_power():
@@ -129,6 +145,42 @@ def _place_order(payload: dict, ticker: str, label: str) -> dict:
         return {"error": str(e)}
 
 
+def _wait_for_fill(order_id: str, ticker: str) -> dict | None:
+    """
+    Poll an order until it's filled or the timeout is reached.
+    Returns the filled order dict, or None if not filled in time.
+    """
+    for attempt in range(FILL_POLL_MAX):
+        try:
+            r = requests.get(
+                f"{PAPER_URL}/orders/{order_id}",
+                headers=HEADERS,
+                timeout=10,
+            )
+            if not r.ok:
+                print(f"[{ticker}] fill poll error {r.status_code}")
+                time.sleep(FILL_POLL_INTERVAL)
+                continue
+
+            order = r.json()
+            status = order.get("status", "")
+            print(f"[{ticker}] fill poll {attempt+1}/{FILL_POLL_MAX} — status: {status}")
+
+            if status == "filled":
+                return order
+            if status in ("canceled", "expired", "rejected"):
+                print(f"[{ticker}] entry order {status} — aborting")
+                return None
+
+        except Exception as e:
+            print(f"[{ticker}] fill poll exception: {e}")
+
+        time.sleep(FILL_POLL_INTERVAL)
+
+    print(f"[{ticker}] entry not filled after {FILL_POLL_MAX * FILL_POLL_INTERVAL}s — protective orders skipped")
+    return None
+
+
 # ── LONG execution ────────────────────────────────────────────────────────────
 
 def _execute_long(sig: dict) -> dict:
@@ -143,7 +195,7 @@ def _execute_long(sig: dict) -> dict:
         return {"success": False, "error": "shares < 1"}
 
     tp1_shares  = max(1, math.floor(shares / 3))
-    stop_shares = shares  # will be reduced by monitor after TP1
+    rem_shares  = shares - tp1_shares  # for stop after TP1 filled
 
     # 1. Entry: market buy
     entry = _place_order({
@@ -159,7 +211,38 @@ def _execute_long(sig: dict) -> dict:
 
     entry_id = entry.get("id", "")
 
-    # 2. TP1 limit sell (1/3)
+    # 2. Wait for fill before placing protective orders
+    filled_order = _wait_for_fill(entry_id, ticker)
+    filled_price = price  # fallback to signal price
+    if filled_order:
+        try:
+            fp = filled_order.get("filled_avg_price")
+            if fp:
+                filled_price = float(fp)
+        except Exception:
+            pass
+    else:
+        # Entry placed but not filled yet — return partial success
+        # monitor.py will detect the position and can place orders later
+        return {
+            "success":       True,
+            "direction":     "LONG",
+            "ticker":        ticker,
+            "shares":        shares,
+            "tp1_shares":    tp1_shares,
+            "entry_price":   price,
+            "stop":          stop,
+            "tp1":           tp1,
+            "tp2":           tp2,
+            "tp3":           sig.get("tp3", 0),
+            "entry_id":      entry_id,
+            "tp1_order_id":  "",
+            "stop_order_id": "",
+            "fill_warning":  "Entry not confirmed filled — protective orders not placed",
+            "timestamp":     datetime.now().isoformat(),
+        }
+
+    # 3. TP1 limit sell (1/3)
     tp1_order = _place_order({
         "symbol":        ticker,
         "qty":           str(tp1_shares),
@@ -171,10 +254,13 @@ def _execute_long(sig: dict) -> dict:
 
     tp1_order_id = tp1_order.get("id", "") if "error" not in tp1_order else ""
 
-    # 3. Stop-market sell (full qty — monitor reduces after TP1 hit)
+    # Small delay to avoid race condition on Alpaca's side
+    time.sleep(0.5)
+
+    # 4. Stop-market sell (full qty — monitor reduces qty after TP1 hit)
     stop_order = _place_order({
         "symbol":        ticker,
-        "qty":           str(stop_shares),
+        "qty":           str(shares),
         "side":          "sell",
         "type":          "stop",
         "time_in_force": "gtc",
@@ -189,7 +275,7 @@ def _execute_long(sig: dict) -> dict:
         "ticker":        ticker,
         "shares":        shares,
         "tp1_shares":    tp1_shares,
-        "entry_price":   price,
+        "entry_price":   filled_price,
         "stop":          stop,
         "tp1":           tp1,
         "tp2":           tp2,
@@ -206,9 +292,10 @@ def _execute_long(sig: dict) -> dict:
 def _execute_short(sig: dict) -> dict:
     """
     Short-sell flow:
-    1. Market sell short (entry)
-    2. GTC limit buy-to-cover at TP1 (1/3 shares) — price BELOW entry
-    3. GTC stop-market buy-to-cover at stop (price ABOVE entry, loss cap)
+    1. Market sell_short (entry)
+    2. Wait for fill
+    3. GTC limit buy-to-cover at TP1 (1/3 shares) — price BELOW entry
+    4. GTC stop-market buy-to-cover at stop (price ABOVE entry, loss cap)
     """
     ticker = sig["ticker"]
     price  = sig["price"]
@@ -220,7 +307,7 @@ def _execute_short(sig: dict) -> dict:
     if shares < 1:
         return {"success": False, "error": "shares < 1"}
 
-    # Validate short direction — stop must be above entry
+    # Validate short direction
     if stop <= price:
         msg = f"SHORT stop {stop} must be > entry {price}"
         print(f"[{ticker}] {msg}")
@@ -231,14 +318,14 @@ def _execute_short(sig: dict) -> dict:
         print(f"[{ticker}] {msg}")
         return {"success": False, "error": msg}
 
-    tp1_shares  = max(1, math.floor(shares / 3))
-    stop_shares = shares
+    tp1_shares = max(1, math.floor(shares / 3))
 
     # 1. Entry: market sell short
+    # Note: use "sell_short" explicitly for paper trading clarity
     entry = _place_order({
         "symbol":        ticker,
         "qty":           str(shares),
-        "side":          "sell",
+        "side":          "sell",          # Alpaca paper accepts "sell" for short too
         "type":          "market",
         "time_in_force": "day",
     }, ticker, "SHORT entry (sell short)")
@@ -248,7 +335,36 @@ def _execute_short(sig: dict) -> dict:
 
     entry_id = entry.get("id", "")
 
-    # 2. TP1 limit buy-to-cover (1/3 shares)
+    # 2. Wait for fill
+    filled_order = _wait_for_fill(entry_id, ticker)
+    filled_price = price
+    if filled_order:
+        try:
+            fp = filled_order.get("filled_avg_price")
+            if fp:
+                filled_price = float(fp)
+        except Exception:
+            pass
+    else:
+        return {
+            "success":       True,
+            "direction":     "SHORT",
+            "ticker":        ticker,
+            "shares":        shares,
+            "tp1_shares":    tp1_shares,
+            "entry_price":   price,
+            "stop":          stop,
+            "tp1":           tp1,
+            "tp2":           tp2,
+            "tp3":           sig.get("tp3", 0),
+            "entry_id":      entry_id,
+            "tp1_order_id":  "",
+            "stop_order_id": "",
+            "fill_warning":  "Entry not confirmed filled — protective orders not placed",
+            "timestamp":     datetime.now().isoformat(),
+        }
+
+    # 3. TP1 limit buy-to-cover (1/3 shares)
     tp1_order = _place_order({
         "symbol":        ticker,
         "qty":           str(tp1_shares),
@@ -260,10 +376,12 @@ def _execute_short(sig: dict) -> dict:
 
     tp1_order_id = tp1_order.get("id", "") if "error" not in tp1_order else ""
 
-    # 3. Stop-market buy-to-cover (full qty)
+    time.sleep(0.5)
+
+    # 4. Stop-market buy-to-cover (full qty)
     stop_order = _place_order({
         "symbol":        ticker,
-        "qty":           str(stop_shares),
+        "qty":           str(shares),
         "side":          "buy",
         "type":          "stop",
         "time_in_force": "gtc",
@@ -278,7 +396,7 @@ def _execute_short(sig: dict) -> dict:
         "ticker":        ticker,
         "shares":        shares,
         "tp1_shares":    tp1_shares,
-        "entry_price":   price,
+        "entry_price":   filled_price,
         "stop":          stop,
         "tp1":           tp1,
         "tp2":           tp2,
@@ -300,7 +418,6 @@ def execute_signal(sig: dict) -> dict:
     direction = sig.get("direction", "LONG")
     signal    = sig.get("signal", "")
 
-    # Normalize: "BUY" signal with LONG direction, "SHORT" signal with SHORT direction
     if signal == "SHORT" or direction == "SHORT":
         return _execute_short(sig)
     else:
@@ -339,6 +456,10 @@ def format_execution_result(result: dict, sig: dict) -> str:
     tp1_shares = result.get("tp1_shares", max(1, shares // 3))
     rem_shares = shares - tp1_shares
 
+    tp1_id   = result.get("tp1_order_id", "")
+    stop_id  = result.get("stop_order_id", "")
+    warn     = result.get("fill_warning", "")
+
     lines = [
         f"✅ {dir_icon} EXECUTED — {ticker}",
         f"",
@@ -356,9 +477,12 @@ def format_execution_result(result: dict, sig: dict) -> str:
         f"",
         f"Orders:",
         f"  Entry:  {result.get('entry_id','?')[:8]}",
-        f"  TP1:    {result.get('tp1_order_id','?')[:8] or 'failed'}",
-        f"  Stop:   {result.get('stop_order_id','?')[:8] or 'failed'}",
+        f"  TP1:    {tp1_id[:8] if tp1_id else '⚠ failed'}",
+        f"  Stop:   {stop_id[:8] if stop_id else '⚠ failed'}",
     ]
+
+    if warn:
+        lines += ["", f"⚠ {warn}"]
 
     return "\n".join(lines)
 
@@ -366,10 +490,6 @@ def format_execution_result(result: dict, sig: dict) -> str:
 # ── Portfolio & Trade History ─────────────────────────────────────────────────
 
 def _fetch_portfolio_history(period: str, timeframe: str) -> list[float]:
-    """
-    Fetch equity curve from Alpaca portfolio history.
-    Returns list of equity values (oldest → newest), or [] on failure.
-    """
     try:
         params = {"timeframe": timeframe}
         if period != "all":
@@ -382,7 +502,7 @@ def _fetch_portfolio_history(period: str, timeframe: str) -> list[float]:
         )
         if not r.ok:
             return []
-        data = r.json()
+        data   = r.json()
         equity = data.get("equity", [])
         return [float(v) for v in equity if v is not None]
     except Exception:
@@ -390,7 +510,6 @@ def _fetch_portfolio_history(period: str, timeframe: str) -> list[float]:
 
 
 def _calc_gain(equity_series: list[float]) -> tuple[float | None, float | None]:
-    """Given an equity series, return (dollar_gain, pct_gain) or (None, None)."""
     if len(equity_series) < 2:
         return None, None
     start = equity_series[0]
