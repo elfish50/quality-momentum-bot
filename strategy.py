@@ -100,7 +100,7 @@ EXT_2618 = 2.618
 
 # ── Strategy thresholds (v9 — hardened quality) ───────────────────────────────
 VOL_CONFIRM_RATIO  = 1.1
-MIN_QUALITY_SCORE  = 45     # was 25
+MIN_QUALITY_SCORE  = 35     # was 45, loosened — Finnhub missing data too common
 MIN_WAVE1_MOVE     = 0.03
 MIN_RR_TP2         = 1.5
 MIN_SIGNAL_SCORE   = 50     # new: auto-execute only if score >= 50
@@ -516,8 +516,8 @@ def quality_score(fund: dict):
     score, failed = 0.0, []
 
     if fund.get("_data_missing"):
-        # No Finnhub data = unknown quality = do not trade
-        return 0.0, ["⛔ No fundamental data — rejected"]
+        # No Finnhub data — penalize but allow if technical setup is strong
+        return 20.0, ["⚠ No fundamental data — reduced score"]
 
     # Market cap filter
     mc = fund.get("market_cap", 0)
