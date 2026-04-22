@@ -21,6 +21,18 @@ from config import BOT_TOKEN, CHAT_ID
 # Global reference so scheduler jobs can reach the bot
 _bot_app = None
 
+# Junk positions to clean up — low quality / penny stocks / bad shorts
+JUNK_TICKERS = [
+    "HIVE",   # SHORT -28%, trend reversed
+    "WSHP",   # LONG  -18.8%, no thesis
+    "TSCO",   # LONG  -12.6%, significant drawdown
+    "TSLG",   # LONG  -7%, low quality ticker
+    "SRXH",   # LONG  -2.5%, penny stock (21k shares)
+    "BIYA",   # LONG  -4%, micro-cap junk
+    "BMNU",   # LONG  -0.3%, micro-cap junk
+    "WMT",    # SHORT -4.3%, fighting uptrend
+]
+
 
 async def error_handler(update, context):
     error = context.error
@@ -31,7 +43,7 @@ async def error_handler(update, context):
     traceback.print_exc()
 
 
-# ── Scheduler job functions (true async, no lambdas) ─────────────────────────
+# ── Scheduler job functions ───────────────────────────────────────────────────
 
 async def scheduled_scan():
     from scanner import run_universe_scan
@@ -44,6 +56,38 @@ async def scheduled_monitor():
     print(f"[monitor] Check at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, lambda: run_monitor(bot=_bot_app.bot, chat_id=CHAT_ID))
+
+
+# ── Close helpers ─────────────────────────────────────────────────────────────
+
+def _close_position(ticker: str) -> dict:
+    """
+    Close a position at market via Alpaca DELETE /positions/{ticker}.
+    Returns {"success": True/False, "msg": str}
+    """
+    import requests
+    ALPACA_KEY    = os.getenv("ALPACA_KEY", "")
+    ALPACA_SECRET = os.getenv("ALPACA_SECRET", "")
+    PAPER_URL     = "https://paper-api.alpaca.markets/v2"
+    headers = {
+        "APCA-API-KEY-ID":     ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+    try:
+        r = requests.delete(
+            f"{PAPER_URL}/positions/{ticker}",
+            headers=headers,
+            timeout=15,
+        )
+        if r.status_code in (200, 204):
+            return {"success": True, "msg": f"{ticker} closed at market."}
+        elif r.status_code == 404:
+            return {"success": False, "msg": f"{ticker} — no open position found."}
+        else:
+            data = r.json() if r.content else {}
+            return {"success": False, "msg": f"{ticker} error {r.status_code}: {data.get('message', r.text[:100])}"}
+    except Exception as e:
+        return {"success": False, "msg": f"{ticker} exception: {e}"}
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
@@ -65,6 +109,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/portfolio - Paper account P&L\n"
         "/trades - Recent trade history\n"
         "/cancel - Cancel all open orders\n"
+        "/close TICKER - Close one position at market\n"
+        "/closejunk - Close all low-quality positions\n"
         "/strategy - How it works\n"
         "/settings - Bot settings\n"
         "Scans + monitor: Mon-Fri 10AM, 12:30PM, 2:30PM ET"
@@ -75,8 +121,8 @@ async def cmd_strategy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Elliott Wave + Fibonacci Strategy\n"
         "==============================\n"
-        "SETUPS (LONG ONLY):\n"
-        "  Wave 2: 50-61.8% Fib retracement\n"
+        "SETUPS (LONG + SHORT):\n"
+        "  Wave 2: 38.2-78.6% Fib retracement\n"
         "  Wave 4: 38.2% Fib retracement\n"
         "  ABC: End of corrective wave\n\n"
         "STOPS (invalidation rules):\n"
@@ -88,10 +134,11 @@ async def cmd_strategy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  TP2: 1.618x — sell remaining 2/3\n"
         "  TP3: 2.618x — stretch target\n\n"
         "SIGNALS:\n"
-        "  BUY = volume confirmed (auto-executed)\n"
-        "  WATCH = wait for volume before entering\n\n"
-        "Quality: Berkshire screen (ROE/margins/EPS)\n"
-        "Account: $1k paper | Risk: $100/trade"
+        "  BUY/SHORT = vol confirmed + score≥50 (auto-executed)\n"
+        "  WATCH = volume pending (alert only)\n\n"
+        "Quality: ROE/margins/EPS/D-E screen\n"
+        "Min price: $10 | Min mkt cap: $500M\n"
+        "Risk: 1% of live equity per trade"
     )
 
 
@@ -181,6 +228,59 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error:\n{traceback.format_exc()[-400:]}")
 
 
+async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /close TICKER — close one position at market.
+    Example: /close HIVE
+    """
+    if not ctx.args:
+        await update.message.reply_text("Usage: /close TICKER\nExample: /close HIVE")
+        return
+
+    ticker = ctx.args[0].upper()
+    await update.message.reply_text(f"Closing {ticker} at market...")
+
+    try:
+        loop   = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: _close_position(ticker))
+        icon   = "✅" if result["success"] else "❌"
+        await update.message.reply_text(f"{icon} {result['msg']}")
+    except Exception:
+        await update.message.reply_text(f"Error:\n{traceback.format_exc()[-300:]}")
+
+
+async def cmd_closejunk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /closejunk — close all pre-defined low-quality positions at market.
+    List is defined in JUNK_TICKERS at the top of bot.py.
+    """
+    await update.message.reply_text(
+        f"Closing {len(JUNK_TICKERS)} junk positions at market:\n"
+        f"{', '.join(JUNK_TICKERS)}\n\nThis may take a moment..."
+    )
+
+    lines   = []
+    loop    = asyncio.get_event_loop()
+    success = 0
+    skipped = 0
+
+    for ticker in JUNK_TICKERS:
+        try:
+            result = await loop.run_in_executor(None, lambda t=ticker: _close_position(t))
+            if result["success"]:
+                lines.append(f"✅ {result['msg']}")
+                success += 1
+            else:
+                lines.append(f"⚠️ {result['msg']}")
+                skipped += 1
+        except Exception as e:
+            lines.append(f"❌ {ticker}: {e}")
+            skipped += 1
+
+    summary = f"\nDone — {success} closed, {skipped} skipped/not found."
+    await update.message.reply_text("\n".join(lines) + summary)
+
+
 async def cmd_scan_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     from scanner import run_universe_scan
     chat_id = str(update.effective_chat.id)
@@ -262,19 +362,22 @@ async def cmd_universe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Bot Settings\n"
+        "Bot Settings (v9)\n"
         "==============================\n"
         "Strategy:  Elliott Wave + Fibonacci\n"
-        "Direction: LONG ONLY\n"
+        "Direction: LONG + SHORT\n"
         "Timeframe: Daily bars\n"
         "Universe:  Alpaca most-actives + assets\n"
         "Data:      Alpaca + Finnhub\n"
-        "Account:   $1k paper\n"
-        "Risk:      $100/trade\n"
-        "BUY:       volume confirmed (auto-executed)\n"
+        "Min price: $10.00\n"
+        "Min mkt cap: $500M\n"
+        "Min avg vol: 500k/day\n"
+        "Risk:      1% of live equity/trade\n"
+        "Max pos:   5% of equity\n"
+        "BUY/SHORT: vol confirmed + score≥50\n"
         "WATCH:     volume pending (alert only)\n"
         "Schedule:  Mon-Fri 10AM, 12:30PM, 2:30PM ET\n"
-        "Monitor:   15 min after each scan (10:15, 12:45, 14:45)"
+        "Monitor:   15 min after each scan"
     )
 
 
@@ -310,10 +413,9 @@ def main():
     bot_app.add_handler(CommandHandler("positions",      cmd_positions))
     bot_app.add_handler(CommandHandler("trades",         cmd_trades))
     bot_app.add_handler(CommandHandler("cancel",         cmd_cancel))
+    bot_app.add_handler(CommandHandler("close",          cmd_close))
+    bot_app.add_handler(CommandHandler("closejunk",      cmd_closejunk))
 
-    # AsyncIOScheduler runs coroutines natively — pass async def directly,
-    # no lambda wrapping needed. The scheduler shares the same event loop
-    # as run_polling, so coroutine dispatch is reliable.
     scheduler = AsyncIOScheduler(timezone="America/New_York")
 
     # ── 10:00 AM scan → 10:15 AM monitor ─────────────────────────────────────
@@ -349,7 +451,7 @@ def main():
     async def on_startup(application):
         scheduler.start()
         await application.bot.delete_webhook(drop_pending_updates=True)
-        print("Quality Momentum Bot running!")
+        print("Quality Momentum Bot running! (v9)")
         print("  Scans:   Mon-Fri 10:00, 12:30, 14:30 ET")
         print("  Monitor: Mon-Fri 10:15, 12:45, 14:45 ET")
         for job in scheduler.get_jobs():
