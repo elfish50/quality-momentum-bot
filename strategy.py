@@ -2,21 +2,16 @@
 ELLIOTT WAVE + FIBONACCI STRATEGY
 Based on Asaf Naamani's framework
 
-PATCH v9 — Quality hardening + account size fix
+PATCH v10 — LONG ONLY hardening
 ════════════════════════════════════════════════════════════════
-Changes from v8:
-  - ACCOUNT now reads live equity from Alpaca instead of hardcoded $1k
-  - _data_missing → quality_score returns 0 (hard reject, not free pass)
-  - MIN_QUALITY_SCORE raised: 45 (was 25)
-  - MIN_PRICE hard filter: $10.00 — penny/micro stocks rejected before analysis
-  - MIN_MARKET_CAP: $500M — filters nano/micro caps (when data available)
-  - Short setups now require trend == "down" only (neutral removed)
-  - Wave 2 Short Fib window tightened: 50–78.6% only (was 50–78.6% but firing too often)
-  - Added min_volume check in analyze_ticker: 500k avg daily volume
-  - Score threshold for BUY/SHORT raised: vol_confirmed still required,
-    but also signal_score >= 50 required to auto-execute
-
-All v8 patches preserved (shorts, soft trend filter for longs, loosened RSI/wave params).
+Changes from v9:
+  - SHORT setups completely removed (Wave 2 Short, Wave 4 Short, ABC Short)
+  - _data_missing → hard reject (quality_score returns 0, not 20)
+  - MAX_OPEN_POSITIONS = 10 — bot stops entering new trades above this cap
+  - MIN_QUALITY_SCORE raised back to 45 (now meaningful since missing data = 0)
+  - MIN_PRICE kept at $10.00
+  - MIN_AVG_VOLUME kept at 500k
+  - All v9 patches preserved (live equity, snapshot filter, dedup)
 """
 import sys
 import os
@@ -86,7 +81,7 @@ def get_account_equity() -> float:
     return _ACCOUNT_CACHE["value"] or 100_000
 
 
-RISK_PCT = 0.01   # Risk 1% of account per trade (was 10% of fake $1k = $100, now 1% of real equity)
+RISK_PCT = 0.01  # Risk 1% of account per trade
 
 # ── Fibonacci levels ──────────────────────────────────────────────────────────
 FIB_382 = 0.382
@@ -98,15 +93,16 @@ EXT_1272 = 1.272
 EXT_1618 = 1.618
 EXT_2618 = 2.618
 
-# ── Strategy thresholds (v9 — hardened quality) ───────────────────────────────
+# ── Strategy thresholds (v10) ─────────────────────────────────────────────────
 VOL_CONFIRM_RATIO  = 1.1
-MIN_QUALITY_SCORE  = 35     # was 45, loosened — Finnhub missing data too common
+MIN_QUALITY_SCORE  = 45     # meaningful now that missing data = hard 0
 MIN_WAVE1_MOVE     = 0.03
 MIN_RR_TP2         = 1.5
-MIN_SIGNAL_SCORE   = 50     # new: auto-execute only if score >= 50
-MIN_PRICE          = 10.0   # new: reject penny/micro stocks
-MIN_AVG_VOLUME     = 500_000  # new: reject illiquid stocks
-MIN_MARKET_CAP     = 500_000_000  # new: $500M minimum market cap
+MIN_SIGNAL_SCORE   = 50
+MIN_PRICE          = 10.0
+MIN_AVG_VOLUME     = 500_000
+MIN_MARKET_CAP     = 500_000_000  # $500M minimum
+MAX_OPEN_POSITIONS = 10           # hard cap — no new entries above this
 
 # ── Universe config ───────────────────────────────────────────────────────────
 UNIVERSE_SIZE = 500
@@ -117,14 +113,13 @@ FALLBACK_TICKERS = [
     "PEP","KO","COST","WMT","MCD","ADBE","CRM","ACN","TMO","NFLX",
     "QCOM","INTC","AMD","TXN","HON","UPS","CAT","GS","MS","AXP",
     "BA","GE","MMM","LMT","RTX","DE","EMR","ITW","ETN","PH",
-    "SHOP","ETSY","UBER","LYFT","ABNB","BKNG","COIN","HOOD","PLTR","SNOW",
-    "CRWD","NET","DDOG","ZS","OKTA","MDB","GTLB","CFLT","APP","SOUN",
-    "ENPH","FSLR","PLUG","BE","CHPT","RIVN","NIO","LI","XPEV","LCID",
-    "MARA","RIOT","MSTR","CLSK","IREN","WULF","HUT","CIFR","BTBT","CORZ",
-    "BABA","JD","PDD","BIDU","TCOM","TME","BILI",
+    "SHOP","UBER","ABNB","BKNG","COIN","PLTR","SNOW",
+    "CRWD","NET","DDOG","ZS","OKTA","MDB","APP",
+    "ENPH","FSLR","RIVN","NIO",
+    "BABA","JD","PDD","BIDU","TCOM",
 ]
 
-# ── Deduplication (v3) ────────────────────────────────────────────────────────
+# ── Deduplication ─────────────────────────────────────────────────────────────
 SEEN_FILE        = pathlib.Path("seen_setups.json")
 SEEN_EXPIRY_DAYS = 10
 PRICE_TOLERANCE  = 0.02
@@ -159,6 +154,20 @@ def already_alerted(ticker: str, setup_name: str, price: float, seen: dict) -> b
 def mark_seen(ticker: str, setup_name: str, price: float, seen: dict) -> None:
     key = f"{ticker}::{setup_name}"
     seen[key] = {"price": price, "ts": datetime.now().isoformat()}
+
+
+# ── Open position count check ─────────────────────────────────────────────────
+
+def _count_open_positions() -> int:
+    """Read open_positions.json and return current count."""
+    pos_file = pathlib.Path("open_positions.json")
+    if not pos_file.exists():
+        return 0
+    try:
+        data = json.loads(pos_file.read_text())
+        return len(data)
+    except Exception:
+        return 0
 
 
 # ── Dynamic Universe via Alpaca ───────────────────────────────────────────────
@@ -218,9 +227,6 @@ def _snapshot_filter(
     min_price: float = MIN_PRICE,
     min_volume: float = MIN_AVG_VOLUME,
 ) -> list:
-    """
-    v9: min_price raised to $10 (was $5), min_volume raised to 500k (was 300k).
-    """
     filtered   = []
     chunk_size = 100
 
@@ -341,10 +347,7 @@ def get_weekly_bars(df):
 
 
 def _trend_context(df) -> str:
-    """
-    Returns 'up', 'down', or 'neutral'.
-    Used as a soft filter for longs, hard filter for shorts.
-    """
+    """Returns 'up', 'down', or 'neutral'."""
     try:
         closes_daily = df["Close"]
         sma200       = closes_daily.rolling(200).mean().iloc[-1]
@@ -511,13 +514,12 @@ def get_fundamentals(ticker: str) -> dict:
 
 def quality_score(fund: dict):
     """
-    v9: _data_missing → score 0 (hard reject). Was 30 (free pass).
+    v10: _data_missing → hard reject (score 0). No free passes.
     """
     score, failed = 0.0, []
 
     if fund.get("_data_missing"):
-        # No Finnhub data — penalize but allow if technical setup is strong
-        return 20.0, ["⚠ No fundamental data — reduced score"]
+        return 0.0, ["⛔ No fundamental data — hard reject"]
 
     # Market cap filter
     mc = fund.get("market_cap", 0)
@@ -606,11 +608,11 @@ def _vol_confirmed(df):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LONG SETUPS
+# LONG SETUPS ONLY
 # ══════════════════════════════════════════════════════════════════════════════
 
 def detect_wave2_setup(df, trend: str):
-    """Wave 2 Pullback (LONG). Trend is soft — down reduces score, doesn't reject."""
+    """Wave 2 Pullback (LONG). Trend down reduces score but doesn't reject."""
     df      = compute_indicators(df)
     current = df.iloc[-1]
     price   = float(current["Close"])
@@ -815,235 +817,6 @@ def detect_abc_setup(df, trend: str):
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SHORT SETUPS — v9: all require trend == "down" (neutral removed)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def detect_wave2_short(df, trend: str):
-    """
-    Wave 2 Short — after impulsive drop, price bounces 50–78.6% Fib.
-    v9: requires trend == "down" only (was "down" or "neutral").
-    """
-    if trend != "down":
-        return None
-
-    df      = compute_indicators(df)
-    current = df.iloc[-1]
-    price   = float(current["Close"])
-    rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
-
-    highs, lows = find_swing_points(df, lookback=90, min_bars=5, max_age_bars=40)
-    if len(highs) < 1 or len(lows) < 1:
-        return None
-
-    last_low_loc, wave1_bottom = lows[-1]
-    wave1_top = None
-    for loc, val in reversed(highs):
-        if loc < last_low_loc:
-            wave1_top = val
-            break
-    if wave1_top is None:
-        return None
-
-    wave1_size = wave1_top - wave1_bottom
-    if wave1_size <= 0 or wave1_size / wave1_top < MIN_WAVE1_MOVE:
-        return None
-
-    fib_382 = round(wave1_bottom + wave1_size * FIB_382, 2)
-    fib_500 = round(wave1_bottom + wave1_size * FIB_500, 2)
-    fib_618 = round(wave1_bottom + wave1_size * FIB_618, 2)
-    fib_786 = round(wave1_bottom + wave1_size * FIB_786, 2)
-
-    if not (fib_500 <= price <= fib_786):
-        return None
-
-    rsi_prev = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
-    if not (rsi < rsi_prev and 35 <= rsi <= 75):
-        return None
-
-    if price > float(df.iloc[-4:-1]["High"].max()) * 0.998:
-        return None
-
-    vol_confirmed, vol_ratio = _vol_confirmed(df)
-    stop     = round(wave1_top * 1.01, 2)
-    ext_1272 = round(price - wave1_size * EXT_1272, 2)
-    ext_1618 = round(price - wave1_size * EXT_1618, 2)
-    ext_2618 = round(price - wave1_size * EXT_2618, 2)
-    risk     = stop - price
-
-    if risk <= 0 or (price - ext_1618) / risk < MIN_RR_TP2:
-        return None
-
-    atr = float(current["ATR"]) if not pd.isna(current["ATR"]) else price * 0.02
-
-    return {
-        "setup":        "Wave 2 Short",
-        "direction":    "SHORT",
-        "wave1_top":    round(wave1_top, 2),
-        "wave1_bottom": round(wave1_bottom, 2),
-        "wave1_size":   round(wave1_size, 2),
-        "fib_382": fib_382, "fib_500": fib_500, "fib_618": fib_618, "fib_786": fib_786,
-        "price": round(price, 2), "rsi": round(rsi, 1), "atr": round(atr, 2),
-        "vol_ratio": vol_ratio, "vol_confirmed": vol_confirmed, "stop": stop,
-        "tp1": ext_1272, "tp2": ext_1618, "tp3": ext_2618,
-        "tp1_pct": round((price - ext_1272) / price * 100, 1),
-        "tp2_pct": round((price - ext_1618) / price * 100, 1),
-        "tp3_pct": round((price - ext_2618) / price * 100, 1),
-        "rr_tp1": round((price - ext_1272) / risk, 2),
-        "rr_tp2": round((price - ext_1618) / risk, 2),
-        "risk": round(risk, 2),
-        "setup_detail": {
-            "wave1_top":    round(wave1_top, 2),
-            "wave1_bottom": round(wave1_bottom, 2),
-            "fib_500": fib_500, "fib_618": fib_618, "fib_786": fib_786,
-        }
-    }
-
-
-def detect_wave4_short(df, trend: str):
-    """Wave 4 Short — requires trend == "down"."""
-    if trend != "down":
-        return None
-
-    df      = compute_indicators(df)
-    current = df.iloc[-1]
-    price   = float(current["Close"])
-    rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
-
-    highs, lows = find_swing_points(df, lookback=120, min_bars=5, max_age_bars=40)
-    if len(highs) < 2 or len(lows) < 1:
-        return None
-
-    wave1_top_loc,    wave1_top    = highs[0]
-    wave3_bottom_loc, wave3_bottom = lows[-1]
-    bounce_high_loc,  bounce_high  = highs[-1]
-
-    if not (wave1_top_loc < wave3_bottom_loc):
-        return None
-    if bounce_high_loc < wave3_bottom_loc:
-        return None
-
-    wave3_size = wave1_top - wave3_bottom
-    if wave3_size <= 0:
-        return None
-
-    fib_382_w4 = round(wave3_bottom + wave3_size * FIB_382, 2)
-    fib_500_w4 = round(wave3_bottom + wave3_size * FIB_500, 2)
-
-    if not (fib_382_w4 <= price <= fib_500_w4):
-        return None
-
-    rsi_prev = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
-    if not (rsi < rsi_prev and 35 <= rsi <= 65):
-        return None
-
-    vol_confirmed, vol_ratio = _vol_confirmed(df)
-    stop     = round(bounce_high * 1.01, 2)
-    ext_1272 = round(price - wave3_size * 0.5 * EXT_1272, 2)
-    ext_1618 = round(price - wave3_size * 0.5 * EXT_1618, 2)
-    ext_2618 = round(price - wave3_size * 0.5 * EXT_2618, 2)
-    risk     = stop - price
-
-    if risk <= 0 or (price - ext_1618) / risk < MIN_RR_TP2:
-        return None
-
-    atr = float(current["ATR"]) if not pd.isna(current["ATR"]) else price * 0.02
-
-    return {
-        "setup":        "Wave 4 Short",
-        "direction":    "SHORT",
-        "wave1_top":    round(wave1_top, 2),
-        "wave3_bottom": round(wave3_bottom, 2),
-        "bounce_high":  round(bounce_high, 2),
-        "fib_382": fib_382_w4, "fib_500": fib_500_w4,
-        "price": round(price, 2), "rsi": round(rsi, 1), "atr": round(atr, 2),
-        "vol_ratio": vol_ratio, "vol_confirmed": vol_confirmed, "stop": stop,
-        "tp1": ext_1272, "tp2": ext_1618, "tp3": ext_2618,
-        "tp1_pct": round((price - ext_1272) / price * 100, 1),
-        "tp2_pct": round((price - ext_1618) / price * 100, 1),
-        "tp3_pct": round((price - ext_2618) / price * 100, 1),
-        "rr_tp1": round((price - ext_1272) / risk, 2),
-        "rr_tp2": round((price - ext_1618) / risk, 2),
-        "risk": round(risk, 2),
-        "setup_detail": {
-            "wave1_top":    round(wave1_top, 2),
-            "wave3_bottom": round(wave3_bottom, 2),
-            "bounce_high":  round(bounce_high, 2),
-            "fib_382": fib_382_w4, "fib_500": fib_500_w4,
-        }
-    }
-
-
-def detect_abc_short(df, trend: str):
-    """
-    ABC Short — requires trend == "down" (was "down" or "neutral").
-    """
-    if trend != "down":
-        return None
-
-    df      = compute_indicators(df)
-    current = df.iloc[-1]
-    price   = float(current["Close"])
-    rsi     = float(current["RSI"]) if not pd.isna(current["RSI"]) else 50
-
-    highs, lows = find_swing_points(df, lookback=90, min_bars=4, max_age_bars=40)
-    if len(highs) < 2 or len(lows) < 1:
-        return None
-
-    wave_a_start_loc, wave_a_start = highs[-2]
-    wave_a_end_loc,   wave_a_end   = lows[-1]
-    wave_b_loc,       wave_b_high  = highs[-1]
-
-    if not (wave_a_start_loc < wave_a_end_loc < wave_b_loc):
-        return None
-
-    wave_a_size = wave_a_start - wave_a_end
-    if wave_a_size <= 0 or wave_a_size / wave_a_start < 0.05:
-        return None
-
-    b_zone_low  = round(wave_a_end + wave_a_size * FIB_500, 2)
-    b_zone_high = round(wave_a_start + wave_a_size * 0.05, 2)
-
-    if not (b_zone_low <= price <= b_zone_high):
-        return None
-
-    rsi_prev = float(df.iloc[-2]["RSI"]) if not pd.isna(df.iloc[-2]["RSI"]) else 50
-    if not (rsi < rsi_prev and 40 <= rsi <= 75):
-        return None
-
-    vol_confirmed, vol_ratio = _vol_confirmed(df)
-    stop = round(b_zone_high * 1.01, 2)
-    tp1  = round(wave_a_end, 2)
-    tp2  = round(wave_a_end - wave_a_size * FIB_618, 2)
-    tp3  = round(wave_a_end - wave_a_size * 1.0, 2)
-    risk = stop - price
-
-    if risk <= 0 or (price - tp1) / risk < 1.5:
-        return None
-
-    atr = float(current["ATR"]) if not pd.isna(current["ATR"]) else price * 0.02
-
-    return {
-        "setup":        "ABC Short",
-        "direction":    "SHORT",
-        "wave_a_start": round(wave_a_start, 2), "wave_a_end": round(wave_a_end, 2),
-        "wave_b_high":  round(wave_b_high, 2),
-        "price": round(price, 2), "rsi": round(rsi, 1), "atr": round(atr, 2),
-        "vol_ratio": vol_ratio, "vol_confirmed": vol_confirmed, "stop": stop,
-        "tp1": tp1, "tp2": tp2, "tp3": tp3,
-        "tp1_pct": round((price - tp1) / price * 100, 1),
-        "tp2_pct": round((price - tp2) / price * 100, 1),
-        "tp3_pct": round((price - tp3) / price * 100, 1),
-        "rr_tp1": round((price - tp1) / risk, 2),
-        "rr_tp2": round((price - tp2) / risk, 2),
-        "risk": round(risk, 2),
-        "setup_detail": {
-            "wave_a_start": round(wave_a_start, 2), "wave_a_end": round(wave_a_end, 2),
-            "wave_b_high":  round(wave_b_high, 2),
-        }
-    }
-
-
 # ── Position Sizing ───────────────────────────────────────────────────────────
 
 def position_size(price, stop, direction="LONG"):
@@ -1052,7 +825,7 @@ def position_size(price, stop, direction="LONG"):
     risk         = abs(price - stop)
     if risk <= 0:
         risk = price * 0.05
-    shares     = math.floor(risk_dollars / risk)
+    shares = math.floor(risk_dollars / risk)
     if shares < 1:
         shares = 1
     # Cap: max 5% of account in any single position
@@ -1074,16 +847,22 @@ def analyze_ticker(ticker, seen=None):
         seen = load_seen()
 
     try:
+        # ── v10: Hard max positions cap ──
+        open_count = _count_open_positions()
+        if open_count >= MAX_OPEN_POSITIONS:
+            print(f"[{ticker}] SKIP — max positions reached ({open_count}/{MAX_OPEN_POSITIONS})")
+            return None
+
         df = get_price_data(ticker)
         if df is None or len(df) < 60:
             return None
 
-        # ── v9: Hard price filter before any analysis ──
+        # ── Hard price filter ──
         current_price = float(df.iloc[-1]["Close"])
         if current_price < MIN_PRICE:
             return None
 
-        # ── v9: Hard avg volume filter ──
+        # ── Hard avg volume filter ──
         df_ind = compute_indicators(df)
         avg_vol = float(df_ind.iloc[-1]["VolAvg20"])
         if avg_vol < MIN_AVG_VOLUME:
@@ -1091,20 +870,18 @@ def analyze_ticker(ticker, seen=None):
 
         trend = _trend_context(df)
 
+        # ── LONG ONLY — no short setups ──
         setup = (
             detect_wave2_setup(df, trend) or
             detect_wave4_setup(df, trend) or
-            detect_abc_setup(df, trend)   or
-            detect_wave2_short(df, trend) or
-            detect_wave4_short(df, trend) or
-            detect_abc_short(df, trend)
+            detect_abc_setup(df, trend)
         )
         if setup is None:
             return None
 
         price      = setup["price"]
         setup_name = setup["setup"]
-        direction  = setup.get("direction", "LONG")
+        direction  = "LONG"  # always
 
         if already_alerted(ticker, setup_name, price, seen):
             print(f"[{ticker}] SKIP — already alerted '{setup_name}' at similar price")
@@ -1125,14 +902,9 @@ def analyze_ticker(ticker, seen=None):
         score += q_score * 0.35
 
         rsi = setup["rsi"]
-        if direction == "LONG":
-            if 35 <= rsi <= 55:  score += 25
-            elif 55 < rsi <= 65: score += 15
-            else:                score += 5
-        else:  # SHORT
-            if 45 <= rsi <= 65:  score += 25
-            elif 35 <= rsi < 45: score += 15
-            else:                score += 5
+        if 35 <= rsi <= 55:  score += 25
+        elif 55 < rsi <= 65: score += 15
+        else:                score += 5
 
         if setup["vol_confirmed"]: score += 20
         else:                      score += 8
@@ -1143,16 +915,13 @@ def analyze_ticker(ticker, seen=None):
         else:           score += 5
 
         # Trend alignment bonus/penalty
-        if direction == "LONG"  and trend == "up":    score += 10
-        if direction == "LONG"  and trend == "down":  score -= 15
-        if direction == "SHORT" and trend == "down":  score += 10
-        if direction == "SHORT" and trend == "up":    score -= 15
+        if trend == "up":   score += 10
+        if trend == "down": score -= 15
 
         score = max(0.0, score)
 
-        # ── v9: auto-execute only if vol confirmed AND score >= MIN_SIGNAL_SCORE ──
         if setup.get("vol_confirmed", False) and score >= MIN_SIGNAL_SCORE:
-            signal_type = "BUY" if direction == "LONG" else "SHORT"
+            signal_type = "BUY"
         else:
             signal_type = "WATCH"
 
@@ -1235,11 +1004,9 @@ if __name__ == "__main__":
     print(f"{'='*60}\n")
 
     for r in results:
-        fund_flag  = " [no Finnhub data]" if r.get("fund_missing") else ""
-        dir_icon   = "▼ SHORT" if r["direction"] == "SHORT" else "▲ LONG"
-        sig_icon   = "★" if r["signal"] in ("BUY", "SHORT") else "○"
+        fund_flag = " [no Finnhub data]" if r.get("fund_missing") else ""
         print(
-            f"{sig_icon} {r['ticker']:6s} | {dir_icon} | "
+            f"{'★' if r['signal'] == 'BUY' else '○'} {r['ticker']:6s} | "
             f"{r['setup']:18s} | Score {r['signal_score']:.0f} | "
             f"Price ${r['price']} | TP2 ${r['tp2']} ({r['tp2_pct']:+.1f}%) | "
             f"R:R {r['rr_tp2']:.1f}x | RSI {r['rsi']} | Trend:{r['trend']}{fund_flag}"
