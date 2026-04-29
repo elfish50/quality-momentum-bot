@@ -1,25 +1,13 @@
 """
-trader.py — Order Execution
+trader.py — Order Execution (LONG ONLY)
 
-Handles both LONG (BUY) and SHORT signals from strategy.py.
+v3 — Shorts completely removed.
 
 LONG flow:
   1. Market buy entry
   2. Wait for fill (poll up to 30s)
   3. GTC limit sell at TP1 (1/3 shares)
-  4. GTC stop-market sell below stop (remaining shares)
-
-SHORT flow:
-  1. Market sell_short entry
-  2. Wait for fill (poll up to 30s)
-  3. GTC limit buy-to-cover at TP1 (1/3 shares)
-  4. GTC stop-market buy-to-cover above stop (remaining shares)
-
-FIX v2:
-  - Wait for entry fill before placing TP1/stop orders (Alpaca rejects
-    protective orders if position doesn't exist yet)
-  - Short entry uses side="sell_short" explicitly
-  - ACCOUNT reads live equity from Alpaca (not hardcoded $1k)
+  4. GTC stop-market sell at stop (full shares — monitor reduces after TP1)
 """
 
 import os
@@ -42,9 +30,8 @@ HEADERS = {
 
 RISK_PCT = 0.01  # 1% of live equity per trade
 
-# Fill-wait config
-FILL_POLL_INTERVAL = 2    # seconds between polls
-FILL_POLL_MAX      = 15   # max attempts (= 30 seconds total)
+FILL_POLL_INTERVAL = 2   # seconds between polls
+FILL_POLL_MAX      = 15  # max attempts (30 seconds total)
 
 
 # ── Alpaca Account Helpers ────────────────────────────────────────────────────
@@ -59,8 +46,7 @@ def get_account():
 
 def get_account_equity() -> float:
     try:
-        acc = get_account()
-        return float(acc.get("equity", 100_000))
+        return float(get_account().get("equity", 100_000))
     except Exception:
         return 100_000
 
@@ -122,10 +108,6 @@ def cancel_order(order_id: str) -> bool:
 # ── Order Placement ───────────────────────────────────────────────────────────
 
 def _place_order(payload: dict, ticker: str, label: str) -> dict:
-    """
-    Place a single order. Returns the Alpaca order response dict,
-    or {"error": "..."} on failure.
-    """
     try:
         r = requests.post(
             f"{PAPER_URL}/orders",
@@ -146,10 +128,6 @@ def _place_order(payload: dict, ticker: str, label: str) -> dict:
 
 
 def _wait_for_fill(order_id: str, ticker: str) -> dict | None:
-    """
-    Poll an order until it's filled or the timeout is reached.
-    Returns the filled order dict, or None if not filled in time.
-    """
     for attempt in range(FILL_POLL_MAX):
         try:
             r = requests.get(
@@ -162,7 +140,7 @@ def _wait_for_fill(order_id: str, ticker: str) -> dict | None:
                 time.sleep(FILL_POLL_INTERVAL)
                 continue
 
-            order = r.json()
+            order  = r.json()
             status = order.get("status", "")
             print(f"[{ticker}] fill poll {attempt+1}/{FILL_POLL_MAX} — status: {status}")
 
@@ -194,8 +172,7 @@ def _execute_long(sig: dict) -> dict:
     if shares < 1:
         return {"success": False, "error": "shares < 1"}
 
-    tp1_shares  = max(1, math.floor(shares / 3))
-    rem_shares  = shares - tp1_shares  # for stop after TP1 filled
+    tp1_shares = max(1, math.floor(shares / 3))
 
     # 1. Entry: market buy
     entry = _place_order({
@@ -211,9 +188,9 @@ def _execute_long(sig: dict) -> dict:
 
     entry_id = entry.get("id", "")
 
-    # 2. Wait for fill before placing protective orders
+    # 2. Wait for fill
     filled_order = _wait_for_fill(entry_id, ticker)
-    filled_price = price  # fallback to signal price
+    filled_price = price
     if filled_order:
         try:
             fp = filled_order.get("filled_avg_price")
@@ -222,8 +199,7 @@ def _execute_long(sig: dict) -> dict:
         except Exception:
             pass
     else:
-        # Entry placed but not filled yet — return partial success
-        # monitor.py will detect the position and can place orders later
+        # Entry placed but not confirmed — return without protective orders
         return {
             "success":       True,
             "direction":     "LONG",
@@ -242,7 +218,7 @@ def _execute_long(sig: dict) -> dict:
             "timestamp":     datetime.now().isoformat(),
         }
 
-    # 3. TP1 limit sell (1/3)
+    # 3. TP1 limit sell (1/3 shares)
     tp1_order = _place_order({
         "symbol":        ticker,
         "qty":           str(tp1_shares),
@@ -254,10 +230,9 @@ def _execute_long(sig: dict) -> dict:
 
     tp1_order_id = tp1_order.get("id", "") if "error" not in tp1_order else ""
 
-    # Small delay to avoid race condition on Alpaca's side
     time.sleep(0.5)
 
-    # 4. Stop-market sell (full qty — monitor reduces qty after TP1 hit)
+    # 4. Stop-market sell (full qty — monitor reduces after TP1 hit)
     stop_order = _place_order({
         "symbol":        ticker,
         "qty":           str(shares),
@@ -287,141 +262,11 @@ def _execute_long(sig: dict) -> dict:
     }
 
 
-# ── SHORT execution ───────────────────────────────────────────────────────────
-
-def _execute_short(sig: dict) -> dict:
-    """
-    Short-sell flow:
-    1. Market sell_short (entry)
-    2. Wait for fill
-    3. GTC limit buy-to-cover at TP1 (1/3 shares) — price BELOW entry
-    4. GTC stop-market buy-to-cover at stop (price ABOVE entry, loss cap)
-    """
-    ticker = sig["ticker"]
-    price  = sig["price"]
-    stop   = sig["stop"]   # above entry for shorts
-    tp1    = sig["tp1"]    # below entry for shorts
-    tp2    = sig["tp2"]
-    shares = sig["shares"]
-
-    if shares < 1:
-        return {"success": False, "error": "shares < 1"}
-
-    # Validate short direction
-    if stop <= price:
-        msg = f"SHORT stop {stop} must be > entry {price}"
-        print(f"[{ticker}] {msg}")
-        return {"success": False, "error": msg}
-
-    if tp1 >= price:
-        msg = f"SHORT tp1 {tp1} must be < entry {price}"
-        print(f"[{ticker}] {msg}")
-        return {"success": False, "error": msg}
-
-    tp1_shares = max(1, math.floor(shares / 3))
-
-    # 1. Entry: market sell short
-    # Note: use "sell_short" explicitly for paper trading clarity
-    entry = _place_order({
-        "symbol":        ticker,
-        "qty":           str(shares),
-        "side":          "sell",          # Alpaca paper accepts "sell" for short too
-        "type":          "market",
-        "time_in_force": "day",
-    }, ticker, "SHORT entry (sell short)")
-
-    if "error" in entry:
-        return {"success": False, "error": entry["error"]}
-
-    entry_id = entry.get("id", "")
-
-    # 2. Wait for fill
-    filled_order = _wait_for_fill(entry_id, ticker)
-    filled_price = price
-    if filled_order:
-        try:
-            fp = filled_order.get("filled_avg_price")
-            if fp:
-                filled_price = float(fp)
-        except Exception:
-            pass
-    else:
-        return {
-            "success":       True,
-            "direction":     "SHORT",
-            "ticker":        ticker,
-            "shares":        shares,
-            "tp1_shares":    tp1_shares,
-            "entry_price":   price,
-            "stop":          stop,
-            "tp1":           tp1,
-            "tp2":           tp2,
-            "tp3":           sig.get("tp3", 0),
-            "entry_id":      entry_id,
-            "tp1_order_id":  "",
-            "stop_order_id": "",
-            "fill_warning":  "Entry not confirmed filled — protective orders not placed",
-            "timestamp":     datetime.now().isoformat(),
-        }
-
-    # 3. TP1 limit buy-to-cover (1/3 shares)
-    tp1_order = _place_order({
-        "symbol":        ticker,
-        "qty":           str(tp1_shares),
-        "side":          "buy",
-        "type":          "limit",
-        "time_in_force": "gtc",
-        "limit_price":   str(round(tp1, 2)),
-    }, ticker, "TP1 buy-to-cover")
-
-    tp1_order_id = tp1_order.get("id", "") if "error" not in tp1_order else ""
-
-    time.sleep(0.5)
-
-    # 4. Stop-market buy-to-cover (full qty)
-    stop_order = _place_order({
-        "symbol":        ticker,
-        "qty":           str(shares),
-        "side":          "buy",
-        "type":          "stop",
-        "time_in_force": "gtc",
-        "stop_price":    str(round(stop, 2)),
-    }, ticker, "stop-market buy-to-cover")
-
-    stop_order_id = stop_order.get("id", "") if "error" not in stop_order else ""
-
-    return {
-        "success":       True,
-        "direction":     "SHORT",
-        "ticker":        ticker,
-        "shares":        shares,
-        "tp1_shares":    tp1_shares,
-        "entry_price":   filled_price,
-        "stop":          stop,
-        "tp1":           tp1,
-        "tp2":           tp2,
-        "tp3":           sig.get("tp3", 0),
-        "entry_id":      entry_id,
-        "tp1_order_id":  tp1_order_id,
-        "stop_order_id": stop_order_id,
-        "timestamp":     datetime.now().isoformat(),
-    }
-
-
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def execute_signal(sig: dict) -> dict:
-    """
-    Route BUY → long execution, SHORT → short execution.
-    Returns a result dict with success flag and order IDs.
-    """
-    direction = sig.get("direction", "LONG")
-    signal    = sig.get("signal", "")
-
-    if signal == "SHORT" or direction == "SHORT":
-        return _execute_short(sig)
-    else:
-        return _execute_long(sig)
+    """Always executes as LONG. SHORT signals are not supported."""
+    return _execute_long(sig)
 
 
 # ── Telegram formatting ───────────────────────────────────────────────────────
@@ -430,48 +275,37 @@ def format_execution_result(result: dict, sig: dict) -> str:
     if not result.get("success"):
         return f"❌ Order failed: {result.get('error', 'unknown error')}"
 
-    ticker    = result["ticker"]
-    direction = result.get("direction", "LONG")
-    shares    = result["shares"]
-    price     = result["entry_price"]
-    stop      = result["stop"]
-    tp1       = result["tp1"]
-    tp2       = result["tp2"]
-    tp3       = result.get("tp3", 0)
-    risk_amt  = round(abs(price - stop) * shares, 2)
+    ticker = result["ticker"]
+    shares = result["shares"]
+    price  = result["entry_price"]
+    stop   = result["stop"]
+    tp1    = result["tp1"]
+    tp2    = result["tp2"]
+    tp3    = result.get("tp3", 0)
 
-    if direction == "LONG":
-        dir_icon   = "🟢 LONG"
-        stop_label = "Stop (below)"
-        tp_dir     = "▲"
-    else:
-        dir_icon   = "🔴 SHORT"
-        stop_label = "Stop (above)"
-        tp_dir     = "▼"
-
-    tp1_pct = round(abs(tp1 - price) / price * 100, 1)
-    tp2_pct = round(abs(tp2 - price) / price * 100, 1)
-    tp3_pct = round(abs(tp3 - price) / price * 100, 1) if tp3 else 0
-
+    risk_amt   = round(abs(price - stop) * shares, 2)
+    tp1_pct    = round((tp1 - price) / price * 100, 1)
+    tp2_pct    = round((tp2 - price) / price * 100, 1)
+    tp3_pct    = round((tp3 - price) / price * 100, 1) if tp3 else 0
     tp1_shares = result.get("tp1_shares", max(1, shares // 3))
     rem_shares = shares - tp1_shares
 
-    tp1_id   = result.get("tp1_order_id", "")
-    stop_id  = result.get("stop_order_id", "")
-    warn     = result.get("fill_warning", "")
+    tp1_id  = result.get("tp1_order_id", "")
+    stop_id = result.get("stop_order_id", "")
+    warn    = result.get("fill_warning", "")
 
     lines = [
-        f"✅ {dir_icon} EXECUTED — {ticker}",
+        f"✅ 🟢 LONG EXECUTED — {ticker}",
         f"",
         f"Entry:    ${price:.2f}  ×{shares} shares",
         f"Risk:     ${risk_amt:.2f}",
         f"",
-        f"{stop_label}: ${stop:.2f}",
-        f"TP1 ({tp_dir}{tp1_pct:.1f}%): ${tp1:.2f}  [{tp1_shares} shares]",
-        f"TP2 ({tp_dir}{tp2_pct:.1f}%): ${tp2:.2f}  [{rem_shares} shares]",
+        f"Stop:     ${stop:.2f}",
+        f"TP1 (+{tp1_pct:.1f}%): ${tp1:.2f}  [{tp1_shares} shares]",
+        f"TP2 (+{tp2_pct:.1f}%): ${tp2:.2f}  [{rem_shares} shares]",
     ]
     if tp3:
-        lines.append(f"TP3 ({tp_dir}{tp3_pct:.1f}%): ${tp3:.2f}  [stretch]")
+        lines.append(f"TP3 (+{tp3_pct:.1f}%): ${tp3:.2f}  [stretch]")
 
     lines += [
         f"",
