@@ -1,6 +1,6 @@
 """
 Quality Momentum Bot - Elliott Wave + Fibonacci
-Auto-executes BUY signals on Alpaca paper account
+Auto-executes BUY/SHORT signals on Alpaca paper account
 """
 import asyncio
 import json
@@ -58,25 +58,24 @@ async def scheduled_monitor():
     await loop.run_in_executor(None, lambda: run_monitor(bot=_bot_app.bot, chat_id=CHAT_ID))
 
 
-# ── Close helpers ─────────────────────────────────────────────────────────────
+# ── Alpaca helpers ────────────────────────────────────────────────────────────
+
+def _alpaca_headers():
+    return {
+        "APCA-API-KEY-ID":     os.getenv("ALPACA_KEY", ""),
+        "APCA-API-SECRET-KEY": os.getenv("ALPACA_SECRET", ""),
+        "Content-Type":        "application/json",
+    }
+
+PAPER_URL = "https://paper-api.alpaca.markets/v2"
+
 
 def _close_position(ticker: str) -> dict:
-    """
-    Close a position at market via Alpaca DELETE /positions/{ticker}.
-    Returns {"success": True/False, "msg": str}
-    """
     import requests
-    ALPACA_KEY    = os.getenv("ALPACA_KEY", "")
-    ALPACA_SECRET = os.getenv("ALPACA_SECRET", "")
-    PAPER_URL     = "https://paper-api.alpaca.markets/v2"
-    headers = {
-        "APCA-API-KEY-ID":     ALPACA_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET,
-    }
     try:
         r = requests.delete(
             f"{PAPER_URL}/positions/{ticker}",
-            headers=headers,
+            headers=_alpaca_headers(),
             timeout=15,
         )
         if r.status_code in (200, 204):
@@ -88,6 +87,48 @@ def _close_position(ticker: str) -> dict:
             return {"success": False, "msg": f"{ticker} error {r.status_code}: {data.get('message', r.text[:100])}"}
     except Exception as e:
         return {"success": False, "msg": f"{ticker} exception: {e}"}
+
+
+def _place_order_raw(payload: dict) -> dict:
+    import requests
+    try:
+        r = requests.post(
+            f"{PAPER_URL}/orders",
+            headers=_alpaca_headers(),
+            json=payload,
+            timeout=15,
+        )
+        data = r.json()
+        if not r.ok:
+            return {"error": data.get("message", r.text[:200])}
+        return data
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _cancel_existing_orders(ticker: str):
+    """Cancel any open orders for this ticker before placing new ones."""
+    import requests
+    try:
+        r = requests.get(
+            f"{PAPER_URL}/orders",
+            headers=_alpaca_headers(),
+            params={"status": "open", "limit": 50},
+            timeout=15,
+        )
+        if not r.ok:
+            return
+        for o in r.json():
+            if isinstance(o, dict) and o.get("symbol") == ticker:
+                oid = o.get("id", "")
+                if oid:
+                    requests.delete(
+                        f"{PAPER_URL}/orders/{oid}",
+                        headers=_alpaca_headers(),
+                        timeout=10,
+                    )
+    except Exception:
+        pass
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
@@ -111,6 +152,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/cancel - Cancel all open orders\n"
         "/close TICKER - Close one position at market\n"
         "/closejunk - Close all low-quality positions\n"
+        "/place_stops - Place GTC stops for all open positions\n"
+        "/clear_seen - Clear dedup cache (allow re-scan of same setups)\n"
         "/strategy - How it works\n"
         "/settings - Bot settings\n"
         "Scans + monitor: Mon-Fri 10AM, 12:30PM, 2:30PM ET"
@@ -167,9 +210,11 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sig  = await loop.run_in_executor(None, lambda: analyze_ticker(ticker))
         if sig:
             await update.message.reply_text(format_alert(sig))
-            if sig["signal"] == "BUY":
+            # ── FIX: execute both BUY and SHORT signals ──
+            if sig["signal"] in ("BUY", "SHORT"):
+                direction = sig["signal"]
                 await update.message.reply_text(
-                    "Volume confirmed - auto-executing paper trade..."
+                    f"Volume confirmed - auto-executing paper {direction}..."
                 )
                 from trader import execute_signal, format_execution_result
                 result = await loop.run_in_executor(None, lambda: execute_signal(sig))
@@ -229,17 +274,11 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    /close TICKER — close one position at market.
-    Example: /close HIVE
-    """
     if not ctx.args:
-        await update.message.reply_text("Usage: /close TICKER\nExample: /close HIVE")
+        await update.message.reply_text("Usage: /close TICKER\nExample: /close NCLH")
         return
-
     ticker = ctx.args[0].upper()
     await update.message.reply_text(f"Closing {ticker} at market...")
-
     try:
         loop   = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: _close_position(ticker))
@@ -250,20 +289,14 @@ async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_closejunk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    /closejunk — close all pre-defined low-quality positions at market.
-    List is defined in JUNK_TICKERS at the top of bot.py.
-    """
     await update.message.reply_text(
         f"Closing {len(JUNK_TICKERS)} junk positions at market:\n"
         f"{', '.join(JUNK_TICKERS)}\n\nThis may take a moment..."
     )
-
     lines   = []
     loop    = asyncio.get_event_loop()
     success = 0
     skipped = 0
-
     for ticker in JUNK_TICKERS:
         try:
             result = await loop.run_in_executor(None, lambda t=ticker: _close_position(t))
@@ -276,9 +309,148 @@ async def cmd_closejunk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             lines.append(f"❌ {ticker}: {e}")
             skipped += 1
-
     summary = f"\nDone — {success} closed, {skipped} skipped/not found."
     await update.message.reply_text("\n".join(lines) + summary)
+
+
+async def cmd_place_stops(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /place_stops — Read open_positions.json and place GTC stop + TP1 limit
+    orders in Alpaca for every position that doesn't already have them.
+    Cancels any existing open orders for each ticker first to avoid duplicates.
+    """
+    import math
+
+    POSITIONS_FILE = "open_positions.json"
+
+    try:
+        with open(POSITIONS_FILE) as f:
+            positions = json.load(f)
+    except FileNotFoundError:
+        await update.message.reply_text("❌ open_positions.json not found.")
+        return
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error reading positions: {e}")
+        return
+
+    if not positions:
+        await update.message.reply_text("No positions in open_positions.json.")
+        return
+
+    await update.message.reply_text(
+        f"Placing GTC stops + TP1 orders for {len(positions)} position(s)...\n"
+        "Cancelling existing orders first."
+    )
+
+    loop  = asyncio.get_event_loop()
+    lines = []
+
+    for ticker, pos in positions.items():
+        direction = pos.get("direction", "LONG")
+        shares    = int(pos.get("shares", 0))
+        stop      = float(pos.get("stop", 0))
+        tp1       = float(pos.get("tp1", 0))
+        tp1_hit   = pos.get("tp1_hit", False)
+
+        if shares < 1 or stop <= 0 or tp1 <= 0:
+            lines.append(f"⚠️ {ticker} — missing data, skipped")
+            continue
+
+        tp1_shares = max(1, math.floor(shares / 3))
+        rem_shares = shares - tp1_shares
+
+        # Cancel existing open orders for this ticker
+        await loop.run_in_executor(None, lambda t=ticker: _cancel_existing_orders(t))
+
+        ticker_lines = [f"\n{ticker} ({direction}) {shares}sh:"]
+        errors = 0
+
+        if direction == "LONG":
+            # Stop-market sell
+            stop_result = await loop.run_in_executor(None, lambda: _place_order_raw({
+                "symbol":        ticker,
+                "qty":           str(rem_shares if tp1_hit else shares),
+                "side":          "sell",
+                "type":          "stop",
+                "time_in_force": "gtc",
+                "stop_price":    str(round(stop, 2)),
+            }))
+            if "error" in stop_result:
+                ticker_lines.append(f"  ❌ Stop @ ${stop:.2f}: {stop_result['error']}")
+                errors += 1
+            else:
+                ticker_lines.append(f"  ✅ Stop @ ${stop:.2f} ({rem_shares if tp1_hit else shares}sh)")
+
+            # TP1 limit sell (only if not already hit)
+            if not tp1_hit:
+                tp1_result = await loop.run_in_executor(None, lambda: _place_order_raw({
+                    "symbol":        ticker,
+                    "qty":           str(tp1_shares),
+                    "side":          "sell",
+                    "type":          "limit",
+                    "time_in_force": "gtc",
+                    "limit_price":   str(round(tp1, 2)),
+                }))
+                if "error" in tp1_result:
+                    ticker_lines.append(f"  ❌ TP1 @ ${tp1:.2f}: {tp1_result['error']}")
+                    errors += 1
+                else:
+                    ticker_lines.append(f"  ✅ TP1 @ ${tp1:.2f} ({tp1_shares}sh)")
+
+        else:  # SHORT
+            # Stop-buy (buy-to-cover if price rises)
+            stop_result = await loop.run_in_executor(None, lambda: _place_order_raw({
+                "symbol":        ticker,
+                "qty":           str(rem_shares if tp1_hit else shares),
+                "side":          "buy",
+                "type":          "stop",
+                "time_in_force": "gtc",
+                "stop_price":    str(round(stop, 2)),
+            }))
+            if "error" in stop_result:
+                ticker_lines.append(f"  ❌ Stop @ ${stop:.2f}: {stop_result['error']}")
+                errors += 1
+            else:
+                ticker_lines.append(f"  ✅ Stop @ ${stop:.2f} ({rem_shares if tp1_hit else shares}sh)")
+
+            # TP1 limit buy-to-cover
+            if not tp1_hit:
+                tp1_result = await loop.run_in_executor(None, lambda: _place_order_raw({
+                    "symbol":        ticker,
+                    "qty":           str(tp1_shares),
+                    "side":          "buy",
+                    "type":          "limit",
+                    "time_in_force": "gtc",
+                    "limit_price":   str(round(tp1, 2)),
+                }))
+                if "error" in tp1_result:
+                    ticker_lines.append(f"  ❌ TP1 @ ${tp1:.2f}: {tp1_result['error']}")
+                    errors += 1
+                else:
+                    ticker_lines.append(f"  ✅ TP1 @ ${tp1:.2f} ({tp1_shares}sh)")
+
+        lines.extend(ticker_lines)
+
+    lines.append("\n✅ Done. Verify orders in Alpaca Open Orders panel.")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_clear_seen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /clear_seen — Wipe seen_setups.json so the scanner can re-evaluate
+    tickers it previously suppressed. Use when no new signals for several days.
+    """
+    SEEN_FILE = "seen_setups.json"
+    try:
+        with open(SEEN_FILE, "w") as f:
+            json.dump({}, f)
+        await update.message.reply_text(
+            "✅ Dedup cache cleared.\n"
+            "Next scan will re-evaluate all tickers fresh.\n"
+            "Run /scan to trigger immediately."
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def cmd_scan_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -415,6 +587,8 @@ def main():
     bot_app.add_handler(CommandHandler("cancel",         cmd_cancel))
     bot_app.add_handler(CommandHandler("close",          cmd_close))
     bot_app.add_handler(CommandHandler("closejunk",      cmd_closejunk))
+    bot_app.add_handler(CommandHandler("place_stops",    cmd_place_stops))
+    bot_app.add_handler(CommandHandler("clear_seen",     cmd_clear_seen))
 
     scheduler = AsyncIOScheduler(timezone="America/New_York")
 
