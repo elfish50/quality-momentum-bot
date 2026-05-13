@@ -267,7 +267,7 @@ def get_universe() -> list:
 
     assets = _get_alpaca_assets()
     if assets:
-        sample_size = min(len(assets), UNIVERSE_SIZE * 4)
+       sample_size = min(len(assets), 5000)
         sample      = random.sample(assets, sample_size)
         filtered    = _snapshot_filter(sample)
         result.extend(filtered)
