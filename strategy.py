@@ -2,16 +2,12 @@
 ELLIOTT WAVE + FIBONACCI STRATEGY
 Based on Asaf Naamani's framework
 
-PATCH v10 — LONG ONLY hardening
+PATCH v10.1 — MAX_STOP_PCT cap
 ════════════════════════════════════════════════════════════════
-Changes from v9:
-  - SHORT setups completely removed (Wave 2 Short, Wave 4 Short, ABC Short)
-  - _data_missing → hard reject (quality_score returns 0, not 20)
-  - MAX_OPEN_POSITIONS = 10 — bot stops entering new trades above this cap
-  - MIN_QUALITY_SCORE raised back to 45 (now meaningful since missing data = 0)
-  - MIN_PRICE kept at $10.00
-  - MIN_AVG_VOLUME kept at 500k
-  - All v9 patches preserved (live equity, snapshot filter, dedup)
+Changes from v10:
+  - MAX_STOP_PCT = 0.07 added — stop is never more than 7% below entry
+  - Applied to all three setup detectors: Wave 2, Wave 4, ABC
+  - All other v10 behaviour preserved
 """
 import sys
 import os
@@ -93,7 +89,7 @@ EXT_1272 = 1.272
 EXT_1618 = 1.618
 EXT_2618 = 2.618
 
-# ── Strategy thresholds (v10) ─────────────────────────────────────────────────
+# ── Strategy thresholds (v10.1) ───────────────────────────────────────────────
 VOL_CONFIRM_RATIO  = 1.1
 MIN_QUALITY_SCORE  = 45     # meaningful now that missing data = hard 0
 MIN_WAVE1_MOVE     = 0.03
@@ -103,6 +99,7 @@ MIN_PRICE          = 10.0
 MIN_AVG_VOLUME     = 500_000
 MIN_MARKET_CAP     = 500_000_000  # $500M minimum
 MAX_OPEN_POSITIONS = 10           # hard cap — no new entries above this
+MAX_STOP_PCT       = 0.07         # stop never more than 7% below entry
 
 # ── Universe config ───────────────────────────────────────────────────────────
 UNIVERSE_SIZE = 500
@@ -607,6 +604,15 @@ def _vol_confirmed(df):
     return vol_ratio >= VOL_CONFIRM_RATIO, round(vol_ratio, 2)
 
 
+def _cap_stop(stop: float, price: float) -> float:
+    """Ensure stop is never more than MAX_STOP_PCT below entry price."""
+    floor = round(price * (1 - MAX_STOP_PCT), 2)
+    capped = max(stop, floor)
+    if capped != stop:
+        print(f"[strategy] stop capped: {stop:.2f} → {capped:.2f} (max {MAX_STOP_PCT*100:.0f}% below ${price:.2f})")
+    return capped
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # LONG SETUPS ONLY
 # ══════════════════════════════════════════════════════════════════════════════
@@ -650,7 +656,10 @@ def detect_wave2_setup(df, trend: str):
         return None
 
     vol_confirmed, vol_ratio = _vol_confirmed(df)
-    stop     = round(wave1_origin * 0.99, 2)
+
+    # ── Stop with MAX_STOP_PCT cap ────────────────────────────────────────────
+    stop     = _cap_stop(round(wave1_origin * 0.99, 2), price)
+
     ext_1272 = round(price + wave1_size * EXT_1272, 2)
     ext_1618 = round(price + wave1_size * EXT_1618, 2)
     ext_2618 = round(price + wave1_size * EXT_2618, 2)
@@ -717,7 +726,10 @@ def detect_wave4_setup(df, trend: str):
         return None
 
     vol_confirmed, vol_ratio = _vol_confirmed(df)
-    stop       = round(wave1_high * 0.99, 2)
+
+    # ── Stop with MAX_STOP_PCT cap ────────────────────────────────────────────
+    stop       = _cap_stop(round(wave1_high * 0.99, 2), price)
+
     wave1_size = wave1_high - wave1_origin
     ext_1272   = round(price + wave1_size * EXT_1272, 2)
     ext_1618   = round(price + wave1_size * EXT_1618, 2)
@@ -785,7 +797,10 @@ def detect_abc_setup(df, trend: str):
         return None
 
     vol_confirmed, vol_ratio = _vol_confirmed(df)
-    stop = round(wave_a_end * 0.99, 2)
+
+    # ── Stop with MAX_STOP_PCT cap ────────────────────────────────────────────
+    stop = _cap_stop(round(wave_a_end * 0.99, 2), price)
+
     tp1  = round(wave_a_start, 2)
     tp2  = round(wave_a_start + wave_a_size * FIB_618, 2)
     tp3  = round(wave_a_start + wave_a_size * 1.0, 2)
