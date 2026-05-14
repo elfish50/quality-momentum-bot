@@ -7,6 +7,7 @@ PATCH v10.1 — MAX_STOP_PCT cap
 Changes from v10:
   - MAX_STOP_PCT = 0.07 added — stop is never more than 7% below entry
   - Applied to all three setup detectors: Wave 2, Wave 4, ABC
+  - sample_size increased to 5000 for wider universe coverage
   - All other v10 behaviour preserved
 """
 import sys
@@ -91,15 +92,15 @@ EXT_2618 = 2.618
 
 # ── Strategy thresholds (v10.1) ───────────────────────────────────────────────
 VOL_CONFIRM_RATIO  = 1.1
-MIN_QUALITY_SCORE  = 45     # meaningful now that missing data = hard 0
+MIN_QUALITY_SCORE  = 45
 MIN_WAVE1_MOVE     = 0.03
 MIN_RR_TP2         = 1.5
 MIN_SIGNAL_SCORE   = 50
 MIN_PRICE          = 10.0
 MIN_AVG_VOLUME     = 500_000
-MIN_MARKET_CAP     = 500_000_000  # $500M minimum
-MAX_OPEN_POSITIONS = 10           # hard cap — no new entries above this
-MAX_STOP_PCT       = 0.07         # stop never more than 7% below entry
+MIN_MARKET_CAP     = 500_000_000
+MAX_OPEN_POSITIONS = 10
+MAX_STOP_PCT       = 0.07  # stop never more than 7% below entry
 
 # ── Universe config ───────────────────────────────────────────────────────────
 UNIVERSE_SIZE = 500
@@ -156,7 +157,6 @@ def mark_seen(ticker: str, setup_name: str, price: float, seen: dict) -> None:
 # ── Open position count check ─────────────────────────────────────────────────
 
 def _count_open_positions() -> int:
-    """Read open_positions.json and return current count."""
     pos_file = pathlib.Path("open_positions.json")
     if not pos_file.exists():
         return 0
@@ -267,7 +267,7 @@ def get_universe() -> list:
 
     assets = _get_alpaca_assets()
     if assets:
-       sample_size = min(len(assets), 5000)
+        sample_size = min(len(assets), 5000)
         sample      = random.sample(assets, sample_size)
         filtered    = _snapshot_filter(sample)
         result.extend(filtered)
@@ -344,7 +344,6 @@ def get_weekly_bars(df):
 
 
 def _trend_context(df) -> str:
-    """Returns 'up', 'down', or 'neutral'."""
     try:
         closes_daily = df["Close"]
         sma200       = closes_daily.rolling(200).mean().iloc[-1]
@@ -510,15 +509,11 @@ def get_fundamentals(ticker: str) -> dict:
 
 
 def quality_score(fund: dict):
-    """
-    v10: _data_missing → hard reject (score 0). No free passes.
-    """
     score, failed = 0.0, []
 
     if fund.get("_data_missing"):
         return 0.0, ["⛔ No fundamental data — hard reject"]
 
-    # Market cap filter
     mc = fund.get("market_cap", 0)
     if mc > 0 and mc < MIN_MARKET_CAP:
         return 0.0, [f"⛔ Market cap ${mc/1e6:.0f}M < $500M minimum"]
@@ -606,7 +601,7 @@ def _vol_confirmed(df):
 
 def _cap_stop(stop: float, price: float) -> float:
     """Ensure stop is never more than MAX_STOP_PCT below entry price."""
-    floor = round(price * (1 - MAX_STOP_PCT), 2)
+    floor  = round(price * (1 - MAX_STOP_PCT), 2)
     capped = max(stop, floor)
     if capped != stop:
         print(f"[strategy] stop capped: {stop:.2f} → {capped:.2f} (max {MAX_STOP_PCT*100:.0f}% below ${price:.2f})")
@@ -618,7 +613,6 @@ def _cap_stop(stop: float, price: float) -> float:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def detect_wave2_setup(df, trend: str):
-    """Wave 2 Pullback (LONG). Trend down reduces score but doesn't reject."""
     df      = compute_indicators(df)
     current = df.iloc[-1]
     price   = float(current["Close"])
@@ -656,10 +650,7 @@ def detect_wave2_setup(df, trend: str):
         return None
 
     vol_confirmed, vol_ratio = _vol_confirmed(df)
-
-    # ── Stop with MAX_STOP_PCT cap ────────────────────────────────────────────
     stop     = _cap_stop(round(wave1_origin * 0.99, 2), price)
-
     ext_1272 = round(price + wave1_size * EXT_1272, 2)
     ext_1618 = round(price + wave1_size * EXT_1618, 2)
     ext_2618 = round(price + wave1_size * EXT_2618, 2)
@@ -694,7 +685,6 @@ def detect_wave2_setup(df, trend: str):
 
 
 def detect_wave4_setup(df, trend: str):
-    """Wave 4 Pullback (LONG)."""
     df      = compute_indicators(df)
     current = df.iloc[-1]
     price   = float(current["Close"])
@@ -726,10 +716,7 @@ def detect_wave4_setup(df, trend: str):
         return None
 
     vol_confirmed, vol_ratio = _vol_confirmed(df)
-
-    # ── Stop with MAX_STOP_PCT cap ────────────────────────────────────────────
     stop       = _cap_stop(round(wave1_high * 0.99, 2), price)
-
     wave1_size = wave1_high - wave1_origin
     ext_1272   = round(price + wave1_size * EXT_1272, 2)
     ext_1618   = round(price + wave1_size * EXT_1618, 2)
@@ -765,7 +752,6 @@ def detect_wave4_setup(df, trend: str):
 
 
 def detect_abc_setup(df, trend: str):
-    """ABC Correction (LONG)."""
     df      = compute_indicators(df)
     current = df.iloc[-1]
     price   = float(current["Close"])
@@ -797,10 +783,7 @@ def detect_abc_setup(df, trend: str):
         return None
 
     vol_confirmed, vol_ratio = _vol_confirmed(df)
-
-    # ── Stop with MAX_STOP_PCT cap ────────────────────────────────────────────
     stop = _cap_stop(round(wave_a_end * 0.99, 2), price)
-
     tp1  = round(wave_a_start, 2)
     tp2  = round(wave_a_start + wave_a_size * FIB_618, 2)
     tp3  = round(wave_a_start + wave_a_size * 1.0, 2)
@@ -843,7 +826,6 @@ def position_size(price, stop, direction="LONG"):
     shares = math.floor(risk_dollars / risk)
     if shares < 1:
         shares = 1
-    # Cap: max 5% of account in any single position
     max_position_val = account * 0.05
     max_shares       = math.floor(max_position_val / price) if price > 0 else shares
     shares           = min(shares, max(1, max_shares))
@@ -862,7 +844,6 @@ def analyze_ticker(ticker, seen=None):
         seen = load_seen()
 
     try:
-        # ── v10: Hard max positions cap ──
         open_count = _count_open_positions()
         if open_count >= MAX_OPEN_POSITIONS:
             print(f"[{ticker}] SKIP — max positions reached ({open_count}/{MAX_OPEN_POSITIONS})")
@@ -872,20 +853,17 @@ def analyze_ticker(ticker, seen=None):
         if df is None or len(df) < 60:
             return None
 
-        # ── Hard price filter ──
         current_price = float(df.iloc[-1]["Close"])
         if current_price < MIN_PRICE:
             return None
 
-        # ── Hard avg volume filter ──
-        df_ind = compute_indicators(df)
+        df_ind  = compute_indicators(df)
         avg_vol = float(df_ind.iloc[-1]["VolAvg20"])
         if avg_vol < MIN_AVG_VOLUME:
             return None
 
         trend = _trend_context(df)
 
-        # ── LONG ONLY — no short setups ──
         setup = (
             detect_wave2_setup(df, trend) or
             detect_wave4_setup(df, trend) or
@@ -896,7 +874,7 @@ def analyze_ticker(ticker, seen=None):
 
         price      = setup["price"]
         setup_name = setup["setup"]
-        direction  = "LONG"  # always
+        direction  = "LONG"
 
         if already_alerted(ticker, setup_name, price, seen):
             print(f"[{ticker}] SKIP — already alerted '{setup_name}' at similar price")
@@ -912,7 +890,6 @@ def analyze_ticker(ticker, seen=None):
         stop   = setup["stop"]
         sizing = position_size(price, stop, direction)
 
-        # ── Signal scoring ──
         score = 0.0
         score += q_score * 0.35
 
@@ -929,7 +906,6 @@ def analyze_ticker(ticker, seen=None):
         elif rr >= 2.0: score += 12
         else:           score += 5
 
-        # Trend alignment bonus/penalty
         if trend == "up":   score += 10
         if trend == "down": score -= 15
 
