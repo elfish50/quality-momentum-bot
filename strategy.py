@@ -99,7 +99,7 @@ MIN_SIGNAL_SCORE   = 50
 MIN_PRICE          = 10.0
 MIN_AVG_VOLUME     = 500_000
 MIN_MARKET_CAP     = 500_000_000
-MAX_OPEN_POSITIONS = 10
+MAX_OPEN_POSITIONS = 20
 MAX_STOP_PCT       = 0.07  # stop never more than 7% below entry
 
 # ── Universe config ───────────────────────────────────────────────────────────
