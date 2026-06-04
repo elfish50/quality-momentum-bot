@@ -4,11 +4,13 @@ monitor.py — Position Monitor
 Runs 3x/day (same schedule as scans). For each open position:
 
   LONG positions:
+    - Stop breached (price <= stop): close at market, mark closed, alert
     - TP1 hit (price >= tp1): sell 1/3 at market, cancel TP1 limit,
       cancel old stop, place new stop at break-even
     - Closed (no Alpaca position): mark closed, clear seen_setups.json
 
   SHORT positions:
+    - Stop breached (price >= stop): close at market, mark closed, alert
     - TP1 hit (price <= tp1): buy-to-cover 1/3 at market, cancel TP1 limit,
       cancel old stop, place new stop-buy at break-even (entry price)
     - Closed (no Alpaca position): mark closed, clear seen_setups.json
@@ -71,6 +73,20 @@ def _current_price(ticker: str) -> float | None:
         except Exception:
             continue
     return None
+
+
+def _close_position_market(ticker: str) -> bool:
+    """Close entire position at market via Alpaca DELETE /positions/{ticker}."""
+    try:
+        r = requests.delete(
+            f"{PAPER_URL}/positions/{ticker}",
+            headers=HEADERS,
+            timeout=15,
+        )
+        return r.status_code in (200, 204)
+    except Exception as e:
+        print(f"[monitor] {ticker} close exception: {e}")
+        return False
 
 
 def _cancel_order(order_id: str) -> bool:
@@ -190,6 +206,22 @@ def _process_long(ticker: str, pos: dict, price: float, actions: list, errors: l
     pl_pct = round((price - entry) / entry * 100, 2) if entry else 0
     print(f"[monitor] LONG {ticker} @ ${price:.2f} | entry ${entry:.2f} | P&L {pl_pct:+.1f}%")
 
+    # ── Auto-close on stop breach ─────────────────────────────────────────────
+    if stop > 0 and price <= stop:
+        print(f"[monitor] {ticker} STOP BREACHED @ ${price:.2f} (stop ${stop:.2f}) — closing")
+        _cancel_order(tp1_order_id)
+        _cancel_order(stop_order_id)
+        closed = _close_position_market(ticker)
+        mark_closed(ticker)
+        _clear_seen_key(seen_key)
+        actions.append(
+            f"🛑 LONG {ticker} — STOP HIT @ ${price:.2f} ({pl_pct:+.1f}%)\n"
+            f"   Stop was ${stop:.2f} | Entry ${entry:.2f}\n"
+            f"   {'Closed at market ✅' if closed else 'Close order failed ❌ — check Alpaca'}"
+        )
+        return
+
+    # ── TP1 check ─────────────────────────────────────────────────────────────
     if not tp1_hit and tp1 > 0 and price >= tp1:
         print(f"[monitor] {ticker} TP1 HIT @ ${price:.2f}")
 
@@ -216,9 +248,9 @@ def _process_long(ticker: str, pos: dict, price: float, actions: list, errors: l
 
 def _process_short(ticker: str, pos: dict, price: float, actions: list, errors: list):
     entry         = float(pos.get("entry_price", 0))
-    tp1           = float(pos.get("tp1", 0))   # below entry for shorts
+    tp1           = float(pos.get("tp1", 0))
     tp2           = float(pos.get("tp2", 0))
-    stop          = float(pos.get("stop", 0))  # above entry for shorts
+    stop          = float(pos.get("stop", 0))
     shares        = int(pos.get("shares", 0))
     tp1_shares    = int(pos.get("tp1_shares", max(1, shares // 3)))
     shares_remain = shares - tp1_shares
@@ -227,17 +259,32 @@ def _process_short(ticker: str, pos: dict, price: float, actions: list, errors: 
     stop_order_id = pos.get("stop_order_id", "")
     seen_key      = pos.get("seen_key", "")
 
-    # For shorts: profit when price falls below entry
     pl_pct = round((entry - price) / entry * 100, 2) if entry else 0
     print(f"[monitor] SHORT {ticker} @ ${price:.2f} | entry ${entry:.2f} | P&L {pl_pct:+.1f}%")
 
+    # ── Auto-close on stop breach ─────────────────────────────────────────────
+    if stop > 0 and price >= stop:
+        print(f"[monitor] {ticker} SHORT STOP BREACHED @ ${price:.2f} (stop ${stop:.2f}) — closing")
+        _cancel_order(tp1_order_id)
+        _cancel_order(stop_order_id)
+        closed = _close_position_market(ticker)
+        mark_closed(ticker)
+        _clear_seen_key(seen_key)
+        actions.append(
+            f"🛑 SHORT {ticker} — STOP HIT @ ${price:.2f} ({pl_pct:+.1f}%)\n"
+            f"   Stop was ${stop:.2f} | Entry ${entry:.2f}\n"
+            f"   {'Closed at market ✅' if closed else 'Close order failed ❌ — check Alpaca'}"
+        )
+        return
+
+    # ── TP1 check ─────────────────────────────────────────────────────────────
     if not tp1_hit and tp1 > 0 and price <= tp1:
         print(f"[monitor] {ticker} SHORT TP1 HIT @ ${price:.2f}")
 
         _cancel_order(tp1_order_id)
         _market_buy_cover(ticker, tp1_shares)
 
-        # Move stop-buy to break-even (entry price — if price rises back, exit flat)
+        # Move stop-buy to break-even
         _cancel_order(stop_order_id)
         new_stop_id = _place_stop_buy_gtc(ticker, shares_remain, entry)
 
@@ -277,9 +324,7 @@ def run_monitor(bot=None, chat_id: str = None) -> None:
                 print(f"[monitor] {ticker} — no Alpaca position, marking closed")
                 seen_key = pos.get("seen_key", "")
                 entry    = float(pos.get("entry_price", 0))
-                tp1_hit  = bool(pos.get("tp1_hit", False))
 
-                # Estimate close reason
                 price = _current_price(ticker)
                 if price and entry:
                     pl_pct = round(
