@@ -68,8 +68,15 @@ def _alpaca_headers():
 PAPER_URL = "https://paper-api.alpaca.markets/v2"
 
 
-def _close_position(ticker: str) -> dict:
+def _close_position(ticker: str, cancel_orders_first: bool = True) -> dict:
+    """
+    Close a position at market. By default cancels any existing open orders
+    for the ticker first — resting stop/TP1 orders reserve shares in Alpaca,
+    which causes 'insufficient qty available' 403 errors on close otherwise.
+    """
     import requests
+    if cancel_orders_first:
+        _cancel_existing_orders(ticker)
     try:
         r = requests.delete(
             f"{PAPER_URL}/positions/{ticker}",
@@ -82,7 +89,23 @@ def _close_position(ticker: str) -> dict:
             return {"success": False, "msg": f"{ticker} — no open position found."}
         else:
             data = r.json() if r.content else {}
-            return {"success": False, "msg": f"{ticker} error {r.status_code}: {data.get('message', r.text[:100])}"}
+            msg  = data.get("message", r.text[:100])
+            # If still insufficient qty after cancelling orders, retry once more
+            # (covers race conditions where cancel hadn't fully settled yet)
+            if r.status_code == 403 and "insufficient qty" in msg.lower() and cancel_orders_first:
+                import time
+                time.sleep(1.5)
+                _cancel_existing_orders(ticker)
+                r2 = requests.delete(
+                    f"{PAPER_URL}/positions/{ticker}",
+                    headers=_alpaca_headers(),
+                    timeout=15,
+                )
+                if r2.status_code in (200, 204):
+                    return {"success": True, "msg": f"{ticker} closed at market (after retry)."}
+                data2 = r2.json() if r2.content else {}
+                return {"success": False, "msg": f"{ticker} error {r2.status_code} (retry): {data2.get('message', r2.text[:100])}"}
+            return {"success": False, "msg": f"{ticker} error {r.status_code}: {msg}"}
     except Exception as e:
         return {"success": False, "msg": f"{ticker} exception: {e}"}
 
