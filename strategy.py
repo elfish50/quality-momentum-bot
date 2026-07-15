@@ -2,13 +2,22 @@
 ELLIOTT WAVE + FIBONACCI STRATEGY
 Based on Asaf Naamani's framework
 
-PATCH v10.1 — MAX_STOP_PCT cap
+PATCH v10.2 — Live Alpaca position count (fixes split-brain bug)
 ════════════════════════════════════════════════════════════════
-Changes from v10:
-  - MAX_STOP_PCT = 0.07 added — stop is never more than 7% below entry
-  - Applied to all three setup detectors: Wave 2, Wave 4, ABC
-  - sample_size increased to 5000 for wider universe coverage
-  - All other v10 behaviour preserved
+Changes from v10.1:
+  - _count_open_positions() now queries Alpaca's live /v2/positions
+    endpoint instead of reading local open_positions.json. The local
+    file was diverging from both Alpaca reality and positions.py's
+    own tracker (10/10 stuck in scanner vs 0 in monitor vs 16 real
+    positions in Alpaca) — this caused every buy signal to be
+    skipped for weeks while real positions went unmanaged.
+  - Result is cached 60s to avoid hitting Alpaca once per ticker
+    during a 100+ ticker scan loop.
+  - Fail-safe: if the Alpaca call fails, falls back to last known
+    good count, or MAX_OPEN_POSITIONS (fail CLOSED, i.e. blocks new
+    buys) rather than 0 (which would fail OPEN and risk unlimited
+    entries if the API hiccups).
+  - All other v10.1 behaviour preserved (MAX_STOP_PCT cap, etc).
 """
 import sys
 import os
@@ -90,7 +99,7 @@ EXT_1272 = 1.272
 EXT_1618 = 1.618
 EXT_2618 = 2.618
 
-# ── Strategy thresholds (v10.1) ───────────────────────────────────────────────
+# ── Strategy thresholds (v10.2) ───────────────────────────────────────────────
 VOL_CONFIRM_RATIO  = 1.1
 MIN_QUALITY_SCORE  = 45
 MIN_WAVE1_MOVE     = 0.03
@@ -154,17 +163,46 @@ def mark_seen(ticker: str, setup_name: str, price: float, seen: dict) -> None:
     seen[key] = {"price": price, "ts": datetime.now().isoformat()}
 
 
-# ── Open position count check ─────────────────────────────────────────────────
+# ── Open position count check (LIVE from Alpaca — v10.2 fix) ─────────────────
+
+_POS_COUNT_CACHE      = {"value": None, "ts": None}
+_POS_COUNT_CACHE_SECS = 60  # refresh at most once per minute during a scan
+
 
 def _count_open_positions() -> int:
-    pos_file = pathlib.Path("open_positions.json")
-    if not pos_file.exists():
-        return 0
+    """
+    Live count of open positions directly from Alpaca. This replaces the old
+    local-file read (open_positions.json), which was diverging from both
+    Alpaca reality and positions.py's own tracker — causing scanner to block
+    all buys on a stale count while real positions went unmanaged.
+
+    Cached for 60s since this is called once per ticker in the scan loop.
+    Fails CLOSED (blocks buys) if Alpaca is unreachable, rather than failing
+    open and risking unlimited entries.
+    """
+    now = time.time()
+    if (
+        _POS_COUNT_CACHE["value"] is not None
+        and _POS_COUNT_CACHE["ts"] is not None
+        and now - _POS_COUNT_CACHE["ts"] < _POS_COUNT_CACHE_SECS
+    ):
+        return _POS_COUNT_CACHE["value"]
+
     try:
-        data = json.loads(pos_file.read_text())
-        return len(data)
-    except Exception:
-        return 0
+        r = requests.get(f"{ALPACA_PAPER_URL}/positions", headers=HEADERS, timeout=10)
+        if r.ok:
+            count = len(r.json())
+            _POS_COUNT_CACHE["value"] = count
+            _POS_COUNT_CACHE["ts"]    = now
+            return count
+        print(f"[strategy] positions count error {r.status_code}: {r.text[:120]}")
+    except Exception as e:
+        print(f"[strategy] Could not fetch live position count: {e}")
+
+    # Fail-safe: last known good count, else block (fail closed)
+    if _POS_COUNT_CACHE["value"] is not None:
+        return _POS_COUNT_CACHE["value"]
+    return MAX_OPEN_POSITIONS
 
 
 # ── Dynamic Universe via Alpaca ───────────────────────────────────────────────
