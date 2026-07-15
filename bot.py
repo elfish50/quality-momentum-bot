@@ -22,15 +22,13 @@ from config import BOT_TOKEN, CHAT_ID
 _bot_app = None
 
 # Junk positions to clean up — low quality / penny stocks / bad shorts
+# Updated 2026-07-15: past list (HIVE, WSHP, TSCO, etc.) was stale/already
+# closed. Current losers past the 7% stop cap with no reversal thesis:
 JUNK_TICKERS = [
-    "HIVE",   # SHORT -28%, trend reversed
-    "WSHP",   # LONG  -18.8%, no thesis
-    "TSCO",   # LONG  -12.6%, significant drawdown
-    "TSLG",   # LONG  -7%, low quality ticker
-    "SRXH",   # LONG  -2.5%, penny stock (21k shares)
-    "BIYA",   # LONG  -4%, micro-cap junk
-    "BMNU",   # LONG  -0.3%, micro-cap junk
-    "WMT",    # SHORT -4.3%, fighting uptrend
+    "BMNR",   # LONG -28.8%, well past stop, no reversal signal
+    "KGC",    # LONG -21.7%, gold miner correction, not reversing
+    "CDE",    # LONG -17.5%, past stop, no volume confirmation
+    "CPRT",   # LONG -17.4%, past stop, no reversal signal
 ]
 
 
@@ -131,6 +129,13 @@ def _cancel_existing_orders(ticker: str):
         pass
 
 
+def _get_alpaca_positions() -> list:
+    import requests
+    r = requests.get(f"{PAPER_URL}/positions", headers=_alpaca_headers(), timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -153,6 +158,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/close TICKER - Close one position at market\n"
         "/closejunk - Close all low-quality positions\n"
         "/place_stops - Place GTC stops for all open positions\n"
+        "/reconcile - Backfill tracker from live Alpaca positions\n"
         "/clear_seen - Clear dedup cache (allow re-scan of same setups)\n"
         "/strategy - How it works\n"
         "/settings - Bot settings\n"
@@ -435,6 +441,104 @@ async def cmd_place_stops(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_reconcile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /reconcile — One-time backfill of open_positions.json from live Alpaca
+    positions. Runs in the SAME process/filesystem as the bot, so it fixes
+    the exact file monitor.py reads — no CLI/SSH needed.
+
+    For each Alpaca position not already tracked locally:
+      - direction/entry/shares pulled from Alpaca (real data)
+      - stop = 7% from entry (MAX_STOP_PCT) since original wave stop is lost
+      - tp1/tp2/tp3 = 0 (disabled) — original targets unknown, so only
+        stop-loss protection is enabled until you review and set real ones
+      - "reconciled": true flag added so you can tell these apart later
+
+    SHORT positions get stop ABOVE entry (correct direction for a short).
+    """
+    MAX_STOP_PCT   = 0.07
+    POSITIONS_FILE = "open_positions.json"
+
+    await update.message.reply_text("Reconciling tracker with live Alpaca positions...")
+
+    try:
+        loop = asyncio.get_event_loop()
+        alpaca_positions = await loop.run_in_executor(None, _get_alpaca_positions)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Could not fetch Alpaca positions: {e}")
+        return
+
+    try:
+        with open(POSITIONS_FILE) as f:
+            local = json.load(f)
+    except FileNotFoundError:
+        local = {}
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error reading {POSITIONS_FILE}: {e}")
+        return
+
+    added, skipped = [], []
+
+    for p in alpaca_positions:
+        ticker = p["symbol"]
+        qty    = float(p["qty"])
+        entry  = float(p["avg_entry_price"])
+        direction = "SHORT" if qty < 0 else "LONG"
+        shares    = abs(int(qty))
+
+        if ticker in local and local[ticker].get("closed_at") is None:
+            skipped.append(ticker)
+            continue
+
+        if direction == "LONG":
+            stop = round(entry * (1 - MAX_STOP_PCT), 2)
+        else:
+            stop = round(entry * (1 + MAX_STOP_PCT), 2)
+
+        local[ticker] = {
+            "ticker":        ticker,
+            "direction":     direction,
+            "seen_key":      f"{ticker}::reconciled",
+            "entry_price":   entry,
+            "shares":        shares,
+            "tp1_shares":    max(1, shares // 3),
+            "stop":          stop,
+            "tp1":           0,
+            "tp2":           0,
+            "tp3":           0,
+            "tp1_hit":       False,
+            "tp1_order_id":  "",
+            "stop_order_id": "",
+            "setup":         "RECONCILED",
+            "signal_score":  0,
+            "opened_at":     p.get("created_at"),
+            "closed_at":     None,
+            "close_reason":  None,
+            "reconciled":    True,
+        }
+        added.append((ticker, direction, entry, shares, stop))
+
+    try:
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(local, f, indent=2)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error writing {POSITIONS_FILE}: {e}")
+        return
+
+    lines = [f"Alpaca reports {len(alpaca_positions)} open position(s)."]
+    lines.append(f"Added {len(added)} reconciled position(s):\n")
+    for ticker, direction, entry, shares, stop in added:
+        lines.append(f"  {direction:5s} {ticker:6s} entry ${entry:.2f} x{shares} stop ${stop:.2f}")
+    if skipped:
+        lines.append(f"\nSkipped (already tracked): {', '.join(skipped)}")
+    lines.append(f"\n⚠️ TP levels disabled (0) for reconciled positions — only")
+    lines.append("stop-loss protection is active. Run /positions to review,")
+    lines.append("then /place_stops once you've set real TP targets if desired.")
+    lines.append(f"\nTotal tracked now: {len(local)}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_clear_seen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     /clear_seen — Wipe seen_setups.json so the scanner can re-evaluate
@@ -588,6 +692,7 @@ def main():
     bot_app.add_handler(CommandHandler("close",          cmd_close))
     bot_app.add_handler(CommandHandler("closejunk",      cmd_closejunk))
     bot_app.add_handler(CommandHandler("place_stops",    cmd_place_stops))
+    bot_app.add_handler(CommandHandler("reconcile",      cmd_reconcile))
     bot_app.add_handler(CommandHandler("clear_seen",     cmd_clear_seen))
 
     scheduler = AsyncIOScheduler(timezone="America/New_York")
